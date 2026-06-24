@@ -1,0 +1,16 @@
+{
+  "name": "KubuntuLLDP",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer"
+      ]
+    }
+  },
+  "postCreateCommand": "cargo --version",
+  "remoteUser": "vscode"
+}
+

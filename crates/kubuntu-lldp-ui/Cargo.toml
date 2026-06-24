@@ -1,0 +1,9 @@
+[package]
+name = "kubuntu-lldp-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kubuntu-lldp-core = { path = "../kubuntu-lldp-core" }
+
