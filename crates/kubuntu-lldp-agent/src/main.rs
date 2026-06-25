@@ -20,6 +20,7 @@ use kubuntu_lldp_core::{
 
 const DISCOVERY_CAPTURE_TIMEOUT: Duration = Duration::from_secs(15);
 const DHCP_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_TEST_INTERFACE: &str = "enxc8a3623fbbbe";
 
 #[derive(Debug, Clone)]
 struct AgentState {
@@ -49,14 +50,27 @@ impl AgentState {
 }
 
 fn main() -> io::Result<()> {
-    let socket_path = socket_path_from_args().unwrap_or_else(|| PathBuf::from(DEFAULT_SOCKET_PATH));
+    let config = config_from_args();
+    let socket_path = config
+        .socket_path
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_SOCKET_PATH));
     prepare_socket_dir(&socket_path)?;
 
     let interfaces = list_interfaces()?;
-    let selected_interface = interfaces
-        .iter()
-        .find(|iface| iface.name != "lo")
-        .map(|iface| iface.name.clone())
+    let selected_interface = config
+        .interface
+        .or_else(|| {
+            interfaces
+                .iter()
+                .find(|iface| iface.name == DEFAULT_TEST_INTERFACE)
+                .map(|iface| iface.name.clone())
+        })
+        .or_else(|| {
+            interfaces
+                .iter()
+                .find(|iface| iface.name != "lo")
+                .map(|iface| iface.name.clone())
+        })
         .or_else(|| interfaces.first().map(|iface| iface.name.clone()));
 
     let state = Arc::new(Mutex::new(AgentState {
@@ -96,14 +110,25 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
-fn socket_path_from_args() -> Option<PathBuf> {
+#[derive(Debug, Default)]
+struct Config {
+    socket_path: Option<PathBuf>,
+    interface: Option<String>,
+}
+
+fn config_from_args() -> Config {
+    let mut config = Config::default();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         if arg == "--socket-path" {
-            return args.next().map(PathBuf::from);
+            config.socket_path = args.next().map(PathBuf::from);
+            continue;
+        }
+        if arg == "--interface" {
+            config.interface = args.next();
         }
     }
-    None
+    config
 }
 
 fn prepare_socket_dir(socket_path: &Path) -> io::Result<()> {
