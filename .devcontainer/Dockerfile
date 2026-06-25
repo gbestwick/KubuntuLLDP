@@ -10,6 +10,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     dbus \
     git \
     libdbus-1-dev \
+    libx11-dev \
+    libxcb1-dev \
     libpcap-dev \
     libudev-dev \
     libwayland-dev \
@@ -32,4 +34,3 @@ ENV PATH=/home/vscode/.cargo/bin:$PATH
 
 RUN curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal
 RUN rustup component add clippy rustfmt
-

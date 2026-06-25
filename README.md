@@ -34,6 +34,8 @@ This repo is set up to be developed in a container with the following toolchain:
 - `libdbus-1-dev`
 - `libpcap-dev`
 - `libudev-dev`
+- `libx11-dev`
+- `libxcb1-dev`
 - `libwayland-dev`
 - `libxkbcommon-dev`
 
@@ -44,7 +46,7 @@ The container is the fastest way to keep the environment reproducible while the 
 The first implementation should keep these responsibilities separated:
 
 1. Agent: interface monitoring, packet capture, DHCP negotiation, and privileged configuration
-2. UI: fullscreen status display and user interaction
+2. UI: native fullscreen X11 status display, interface selection, and user interaction
 3. Shared core: state models, message formats, and protocol parsing helpers
 
 ## Startup plan
