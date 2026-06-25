@@ -4,6 +4,7 @@ use std::{
     fs,
     io::{self, BufRead, BufReader, Write},
     net::Shutdown,
+    os::unix::fs::PermissionsExt,
     os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
@@ -18,7 +19,7 @@ use kubuntu_lldp_core::{
     DEFAULT_SOCKET_PATH,
 };
 
-const DISCOVERY_CAPTURE_TIMEOUT: Duration = Duration::from_secs(15);
+const DISCOVERY_CAPTURE_TIMEOUT: Duration = Duration::from_secs(45);
 const DHCP_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_TEST_INTERFACE: &str = "enxc8a3623fbbbe";
 
@@ -33,6 +34,8 @@ struct AgentState {
     last_error: Option<String>,
     desired_generation: u64,
     running_generation: Option<u64>,
+    completed_generation: Option<u64>,
+    pcap_file: Option<PathBuf>,
 }
 
 impl AgentState {
@@ -83,6 +86,8 @@ fn main() -> io::Result<()> {
         last_error: None,
         desired_generation: 0,
         running_generation: None,
+        completed_generation: None,
+        pcap_file: config.pcap_file,
     }));
 
     let monitor_state = Arc::clone(&state);
@@ -92,6 +97,7 @@ fn main() -> io::Result<()> {
         let _ = fs::remove_file(&socket_path);
     }
     let listener = UnixListener::bind(&socket_path)?;
+    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o666))?;
 
     for stream in listener.incoming() {
         match stream {
@@ -114,6 +120,7 @@ fn main() -> io::Result<()> {
 struct Config {
     socket_path: Option<PathBuf>,
     interface: Option<String>,
+    pcap_file: Option<PathBuf>,
 }
 
 fn config_from_args() -> Config {
@@ -126,6 +133,10 @@ fn config_from_args() -> Config {
         }
         if arg == "--interface" {
             config.interface = args.next();
+            continue;
+        }
+        if arg == "--pcap-file" {
+            config.pcap_file = args.next().map(PathBuf::from);
         }
     }
     config
@@ -163,18 +174,25 @@ fn monitor_loop(state: Arc<Mutex<AgentState>>) {
 
                 if selected_up
                     && guard.running_generation != Some(guard.desired_generation)
+                    && guard.completed_generation != Some(guard.desired_generation)
                 {
                     guard.running_generation = Some(guard.desired_generation);
                     guard.discovery_status = "starting".to_string();
                     guard.dhcp_status = "waiting for discovery".to_string();
-                    should_start = Some((selected_name, guard.desired_generation));
+                    should_start = Some((
+                        selected_name,
+                        guard.desired_generation,
+                        guard.pcap_file.clone(),
+                    ));
                 }
             }
         }
 
-        if let Some((interface, generation)) = should_start {
+        if let Some((interface, generation, pcap_file)) = should_start {
             let worker_state = Arc::clone(&state);
-            thread::spawn(move || provision_interface(worker_state, interface, generation));
+            thread::spawn(move || {
+                provision_interface(worker_state, interface, generation, pcap_file)
+            });
         }
 
         thread::sleep(Duration::from_secs(1));
@@ -216,6 +234,7 @@ fn select_interface(state: &Arc<Mutex<AgentState>>, name: String) {
         guard.selected_interface = Some(name);
         guard.desired_generation = guard.desired_generation.wrapping_add(1);
         guard.running_generation = None;
+        guard.completed_generation = None;
         guard.discovery_status = "queued".to_string();
         guard.dhcp_status = "queued".to_string();
         guard.last_error = None;
@@ -226,20 +245,27 @@ fn retry_provisioning(state: &Arc<Mutex<AgentState>>) {
     if let Ok(mut guard) = state.lock() {
         guard.desired_generation = guard.desired_generation.wrapping_add(1);
         guard.running_generation = None;
+        guard.completed_generation = None;
         guard.discovery_status = "queued".to_string();
         guard.dhcp_status = "queued".to_string();
         guard.last_error = None;
     }
 }
 
-fn provision_interface(state: Arc<Mutex<AgentState>>, interface: String, generation: u64) {
-    if let Err(err) = run_provisioning(&state, &interface, generation) {
+fn provision_interface(
+    state: Arc<Mutex<AgentState>>,
+    interface: String,
+    generation: u64,
+    pcap_file: Option<PathBuf>,
+) {
+    if let Err(err) = run_provisioning(&state, &interface, generation, pcap_file.as_deref()) {
         set_error(&state, generation, err.to_string());
     }
 
     if let Ok(mut guard) = state.lock() {
         if guard.desired_generation == generation {
             guard.running_generation = None;
+            guard.completed_generation = Some(generation);
         }
     }
 }
@@ -248,6 +274,7 @@ fn run_provisioning(
     state: &Arc<Mutex<AgentState>>,
     interface: &str,
     generation: u64,
+    pcap_file: Option<&Path>,
 ) -> io::Result<()> {
     set_status(
         state,
@@ -255,18 +282,31 @@ fn run_provisioning(
         "discovery",
         format!("capturing LLDP/CDP on {interface}"),
     );
-    let neighbors = capture_neighbors(interface)?;
-    if !is_current_generation(state, generation) {
-        return Ok(());
-    }
+    let local_macs = local_mac_addresses();
+    match capture_neighbors(interface, pcap_file, &local_macs) {
+        Ok(neighbors) => {
+            if !is_current_generation(state, generation) {
+                return Ok(());
+            }
 
-    update_neighbors(state, generation, neighbors);
-    set_status(
-        state,
-        generation,
-        "discovery",
-        "link-local discovery complete".to_string(),
-    );
+            let count = neighbors.len();
+            update_neighbors(state, generation, neighbors);
+            set_status(
+                state,
+                generation,
+                "discovery",
+                if count == 0 {
+                    "capture completed with no LLDP/CDP neighbors".to_string()
+                } else {
+                    format!("link-local discovery complete: {count} neighbor(s)")
+                },
+            );
+        }
+        Err(err) => {
+            set_phase_error(state, generation, "discovery", err.to_string());
+            return Ok(());
+        }
+    }
 
     set_status(
         state,
@@ -274,19 +314,25 @@ fn run_provisioning(
         "dhcp",
         format!("requesting lease on {interface}"),
     );
-    let dhcp_options = run_dhcp_client(interface)?;
-    if !is_current_generation(state, generation) {
-        return Ok(());
-    }
+    match run_dhcp_client(interface) {
+        Ok(dhcp_options) => {
+            if !is_current_generation(state, generation) {
+                return Ok(());
+            }
 
-    update_dhcp_options(state, generation, interface, dhcp_options)?;
-    set_status(
-        state,
-        generation,
-        "dhcp",
-        "lease acquired and applied".to_string(),
-    );
-    refresh_interface_snapshot(state, interface);
+            update_dhcp_options(state, generation, interface, dhcp_options)?;
+            set_status(
+                state,
+                generation,
+                "dhcp",
+                "lease acquired and applied".to_string(),
+            );
+            refresh_interface_snapshot(state, interface);
+        }
+        Err(err) => {
+            set_phase_error(state, generation, "dhcp", err.to_string());
+        }
+    }
     Ok(())
 }
 
@@ -318,6 +364,20 @@ fn set_error(state: &Arc<Mutex<AgentState>>, generation: u64, value: String) {
         guard.last_error = Some(value);
         guard.discovery_status = "error".to_string();
         guard.dhcp_status = "error".to_string();
+    }
+}
+
+fn set_phase_error(state: &Arc<Mutex<AgentState>>, generation: u64, which: &str, value: String) {
+    if let Ok(mut guard) = state.lock() {
+        if guard.desired_generation != generation {
+            return;
+        }
+        guard.last_error = Some(value);
+        match which {
+            "discovery" => guard.discovery_status = "error".to_string(),
+            "dhcp" => guard.dhcp_status = "error".to_string(),
+            _ => {}
+        }
     }
 }
 
@@ -414,19 +474,32 @@ fn read_trimmed(path: impl AsRef<Path>) -> io::Result<String> {
     fs::read_to_string(path).map(|text| text.trim().to_string())
 }
 
-fn capture_neighbors(interface: &str) -> io::Result<Vec<NeighborRecord>> {
+fn capture_neighbors(
+    interface: &str,
+    pcap_file: Option<&Path>,
+    local_macs: &[String],
+) -> io::Result<Vec<NeighborRecord>> {
+    if let Some(path) = pcap_file {
+        return Ok(unique_neighbors(filter_local_neighbors(
+            parse_neighbor_pcap(&fs::read(path)?),
+            local_macs,
+        )));
+    }
+
     let mut command = Command::new("tcpdump");
     command
             .args([
                 "-i",
                 interface,
+                "-Q",
+                "in",
                 "-U",
                 "-w",
                 "-",
                 "-s",
                 "2048",
                 "-c",
-                "25",
+                "1",
                 "ether proto 0x88cc or ether[20:2] = 0x2000",
             ])
             .stdout(Stdio::piped())
@@ -436,15 +509,72 @@ fn capture_neighbors(interface: &str) -> io::Result<Vec<NeighborRecord>> {
         DISCOVERY_CAPTURE_TIMEOUT,
     )?;
 
-    let mut neighbors = parse_neighbor_pcap(&output.stdout);
+    if output.stdout.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            command_failure("tcpdump", &output),
+        ));
+    }
+
+    let mut neighbors = unique_neighbors(filter_local_neighbors(
+        parse_neighbor_pcap(&output.stdout),
+        local_macs,
+    ));
     neighbors.sort_by(|left, right| {
         protocol_rank(&left.protocol)
             .cmp(&protocol_rank(&right.protocol))
             .then(left.system_name.cmp(&right.system_name))
             .then(left.port_id.cmp(&right.port_id))
     });
-    neighbors.dedup();
     Ok(neighbors)
+}
+
+fn filter_local_neighbors(
+    neighbors: Vec<NeighborRecord>,
+    local_macs: &[String],
+) -> Vec<NeighborRecord> {
+    if local_macs.is_empty() {
+        return neighbors;
+    }
+    neighbors
+        .into_iter()
+        .filter(|neighbor| {
+            neighbor
+                .chassis_id
+                .as_deref()
+                .map(|chassis_id| !local_macs.iter().any(|mac| mac == &chassis_id.to_ascii_lowercase()))
+                .unwrap_or(true)
+        })
+        .collect()
+}
+
+fn local_mac_addresses() -> Vec<String> {
+    list_interfaces()
+        .map(|interfaces| {
+            interfaces
+                .into_iter()
+                .filter_map(|iface| iface.mac_address)
+                .map(|mac| mac.to_ascii_lowercase())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn unique_neighbors(neighbors: Vec<NeighborRecord>) -> Vec<NeighborRecord> {
+    let mut unique = Vec::new();
+    for neighbor in neighbors {
+        let duplicate = unique.iter().any(|existing: &NeighborRecord| {
+            existing.protocol == neighbor.protocol
+                && existing.chassis_id == neighbor.chassis_id
+                && existing.port_id == neighbor.port_id
+                && existing.system_name == neighbor.system_name
+                && existing.system_description == neighbor.system_description
+        });
+        if !duplicate {
+            unique.push(neighbor);
+        }
+    }
+    unique
 }
 
 fn parse_neighbor_pcap(bytes: &[u8]) -> Vec<NeighborRecord> {
@@ -605,8 +735,11 @@ fn decode_lldp_identity(value: &[u8]) -> Option<String> {
     }
     let subtype = value[0];
     let data = &value[1..];
-    let decoded = bytes_to_string(data).unwrap_or_else(|| bytes_to_hex(data));
-    Some(format!("{subtype}:{decoded}"))
+    match subtype {
+        4 if data.len() == 6 => Some(bytes_to_hex(data)),
+        5 | 7 => bytes_to_string(data),
+        _ => bytes_to_string(data).or_else(|| Some(format!("{subtype}:{}", bytes_to_hex(data)))),
+    }
 }
 
 fn bytes_to_string(bytes: &[u8]) -> Option<String> {
@@ -631,13 +764,22 @@ fn run_dhcp_client(interface: &str) -> io::Result<Vec<DhcpOptionRecord>> {
         .args(["link", "set", "dev", interface, "up"])
         .status();
 
+    let mut command = Command::new("dhclient");
+    command
+        .args(["-4", "-v", "-1", interface])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     let output = run_command_with_timeout(
-        Command::new("dhclient")
-            .args(["-4", "-v", "-1", interface])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped()),
+        &mut command,
         DHCP_TIMEOUT,
     )?;
+
+    if !output.status.success() {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            command_failure("dhclient", &output),
+        ));
+    }
 
     let mut options = parse_dhcp_output(&output.stdout);
     options.extend(parse_dhcp_leases(interface));
@@ -757,6 +899,15 @@ fn run_command_with_timeout(command: &mut Command, timeout: Duration) -> io::Res
         }
         thread::sleep(Duration::from_millis(200));
     }
+}
+
+fn command_failure(command: &str, output: &Output) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    format!(
+        "{command} failed with status {}; stdout='{}'; stderr='{}'",
+        output.status, stdout, stderr
+    )
 }
 
 fn read_u32(bytes: &[u8], little_endian: bool) -> u32 {
