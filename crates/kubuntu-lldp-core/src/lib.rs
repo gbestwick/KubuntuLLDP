@@ -35,7 +35,8 @@ pub struct NeighborRecord {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DhcpOptionRecord {
-    pub code: u8,
+    pub code: Option<u8>,
+    pub name: String,
     pub value: String,
 }
 
@@ -45,12 +46,16 @@ pub struct RuntimeSnapshot {
     pub interfaces: Vec<InterfaceSnapshot>,
     pub neighbors: Vec<NeighborRecord>,
     pub dhcp_options: Vec<DhcpOptionRecord>,
+    pub discovery_status: String,
+    pub dhcp_status: String,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentRequest {
     ListState,
     SelectInterface { name: String },
+    RetryProvisioning,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,6 +70,7 @@ pub fn encode_request(request: &AgentRequest) -> String {
         AgentRequest::SelectInterface { name } => {
             format!("SELECT_INTERFACE\t{}", escape_field(name))
         }
+        AgentRequest::RetryProvisioning => "RETRY_PROVISIONING".to_string(),
     }
 }
 
@@ -131,11 +137,23 @@ pub fn encode_response(response: &AgentResponse) -> String {
 
             for option in &snapshot.dhcp_options {
                 out.push_str("dhcp=");
-                out.push_str(&option.code.to_string());
+                push_optional_code(&mut out, option.code);
+                out.push('|');
+                out.push_str(&escape_field(&option.name));
                 out.push('|');
                 out.push_str(&escape_field(&option.value));
                 out.push('\n');
             }
+
+            out.push_str("discovery_status=");
+            out.push_str(&escape_field(&snapshot.discovery_status));
+            out.push('\n');
+            out.push_str("dhcp_status=");
+            out.push_str(&escape_field(&snapshot.dhcp_status));
+            out.push('\n');
+            out.push_str("last_error=");
+            push_optional_field(&mut out, snapshot.last_error.as_deref());
+            out.push('\n');
 
             out.push_str("END\n");
             out
@@ -174,10 +192,23 @@ pub fn decode_response(text: &str) -> Result<AgentResponse, String> {
     let mut interfaces = Vec::new();
     let mut neighbors = Vec::new();
     let mut dhcp_options = Vec::new();
+    let mut discovery_status = String::from("idle");
+    let mut dhcp_status = String::from("idle");
+    let mut last_error = None;
 
     for line in lines {
         if line == "END" {
             break;
+        } else if let Some(value) = line.strip_prefix("discovery_status=") {
+            discovery_status = unescape_field(value)?;
+        } else if let Some(value) = line.strip_prefix("dhcp_status=") {
+            dhcp_status = unescape_field(value)?;
+        } else if let Some(value) = line.strip_prefix("last_error=") {
+            last_error = if value == "-" {
+                None
+            } else {
+                Some(unescape_field(value)?)
+            };
         }
         if let Some(payload) = line.strip_prefix("interface=") {
             let parts = split_escaped(payload, 5)?;
@@ -231,12 +262,19 @@ pub fn decode_response(text: &str) -> Result<AgentResponse, String> {
                 },
             });
         } else if let Some(payload) = line.strip_prefix("dhcp=") {
-            let parts = split_escaped(payload, 2)?;
+            let parts = split_escaped(payload, 3)?;
             dhcp_options.push(DhcpOptionRecord {
-                code: parts[0]
-                    .parse()
-                    .map_err(|err| format!("invalid DHCP code: {err}"))?,
-                value: parts[1].clone(),
+                code: if parts[0] == "-" {
+                    None
+                } else {
+                    Some(
+                        parts[0]
+                            .parse()
+                            .map_err(|err| format!("invalid DHCP code: {err}"))?,
+                    )
+                },
+                name: parts[1].clone(),
+                value: parts[2].clone(),
             });
         }
     }
@@ -246,6 +284,9 @@ pub fn decode_response(text: &str) -> Result<AgentResponse, String> {
         interfaces,
         neighbors,
         dhcp_options,
+        discovery_status,
+        dhcp_status,
+        last_error,
     }))
 }
 
@@ -327,6 +368,13 @@ fn split_escaped(value: &str, expected_fields: usize) -> Result<Vec<String>, Str
 fn push_optional_field(out: &mut String, value: Option<&str>) {
     match value {
         Some(value) => out.push_str(&escape_field(value)),
+        None => out.push('-'),
+    }
+}
+
+fn push_optional_code(out: &mut String, value: Option<u8>) {
+    match value {
+        Some(value) => out.push_str(&value.to_string()),
         None => out.push('-'),
     }
 }

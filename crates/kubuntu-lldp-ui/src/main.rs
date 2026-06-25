@@ -235,6 +235,11 @@ fn run_ui(display: *mut xlib::Display) -> io::Result<()> {
                                 xlib::XCloseDisplay(display);
                                 return Ok(());
                             }
+                            if key == 'r' {
+                                let _ = send_request(DEFAULT_SOCKET_PATH, AgentRequest::RetryProvisioning);
+                                refresh_state(&mut ui);
+                                draw(display, window, gc, width as i32, height as i32, &ui)?;
+                            }
                         }
                     }
                     _ => {}
@@ -280,7 +285,7 @@ fn selected_row_from_snapshot(snapshot: &RuntimeSnapshot) -> Option<usize> {
 
 fn hit_test(_x: c_int, y: c_int, ui: &UiState) -> Option<usize> {
     let snapshot = ui.snapshot.as_ref()?;
-    let start_y = 158;
+    let start_y = 250;
     let row_height = 24;
     if y < start_y {
         return None;
@@ -325,8 +330,36 @@ fn draw(
             120,
             &format!("Selected interface: {selected}"),
         );
+        draw_text(
+            display,
+            window,
+            gc,
+            24,
+            144,
+            &format!("Discovery: {}", snapshot.discovery_status),
+        );
+        draw_text(
+            display,
+            window,
+            gc,
+            24,
+            168,
+            &format!("DHCP: {}", snapshot.dhcp_status),
+        );
+        draw_text(
+            display,
+            window,
+            gc,
+            24,
+            192,
+            &format!(
+                "Last error: {}",
+                snapshot.last_error.as_deref().unwrap_or("none")
+            ),
+        );
+        draw_text(display, window, gc, 24, 216, "Press r to retry provisioning");
 
-        let mut y = 150;
+        let mut y = 250;
         draw_text(display, window, gc, 24, y, "Interfaces");
         y += 24;
         for iface in &snapshot.interfaces {
@@ -370,7 +403,18 @@ fn draw(
             draw_text(display, window, gc, 24, y, "none yet");
         } else {
             for option in &snapshot.dhcp_options {
-                draw_text(display, window, gc, 24, y, &format!("option {} = {}", option.code, option.value));
+                let code = option
+                    .code
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_string());
+                draw_text(
+                    display,
+                    window,
+                    gc,
+                    24,
+                    y,
+                    &format!("option {code} {} = {}", option.name, option.value),
+                );
                 y += 24;
             }
         }
