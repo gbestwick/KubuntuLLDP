@@ -130,6 +130,15 @@ mod xlib {
             width: u32,
             height: u32,
         ) -> c_int;
+        pub fn XDrawRectangle(
+            display: *mut Display,
+            d: Window,
+            gc: GC,
+            x: c_int,
+            y: c_int,
+            width: u32,
+            height: u32,
+        ) -> c_int;
         pub fn XDrawString(
             display: *mut Display,
             d: Window,
@@ -155,13 +164,19 @@ mod xlib {
     }
 }
 
-const MARGIN: i32 = 48;
+const MARGIN: i32 = 40;
+const GUTTER: i32 = 28;
+const HEADER_HEIGHT: i32 = 118;
 const LINE_HEIGHT: i32 = 32;
-const TOUCH_ROW_HEIGHT: i32 = 72;
-const TOUCH_ROW_GAP: i32 = 8;
+const TOUCH_ROW_HEIGHT: i32 = 88;
+const TOUCH_ROW_GAP: i32 = 12;
 const BUTTON_HEIGHT: i32 = 72;
-const BUTTON_Y: i32 = 250;
-const INTERFACE_START_Y: i32 = 366;
+const STATUS_Y: i32 = 146;
+const STATUS_CARD_HEIGHT: i32 = 86;
+const BUTTON_Y: i32 = 258;
+const MAIN_Y: i32 = 362;
+const PANEL_HEADER_HEIGHT: i32 = 54;
+const ROWS_Y: i32 = MAIN_Y + PANEL_HEADER_HEIGHT + 16;
 
 struct UiState {
     snapshot: Option<RuntimeSnapshot>,
@@ -241,7 +256,7 @@ fn run_ui(display: *mut xlib::Display) -> io::Result<()> {
                             xlib::XDestroyWindow(display, window);
                             xlib::XCloseDisplay(display);
                             return Ok(());
-                        } else if let Some(row) = hit_test(button.x, button.y, &ui) {
+                        } else if let Some(row) = hit_test(button.x, button.y, width as i32, &ui) {
                             if let Some(snapshot) = &ui.snapshot {
                                 if let Some(iface) = snapshot.interfaces.get(row) {
                                     let request = AgentRequest::SelectInterface {
@@ -336,9 +351,14 @@ fn selected_row_from_snapshot(snapshot: &RuntimeSnapshot) -> Option<usize> {
         .position(|iface| iface.is_selected)
 }
 
-fn hit_test(_x: c_int, y: c_int, ui: &UiState) -> Option<usize> {
+fn hit_test(x: c_int, y: c_int, width: i32, ui: &UiState) -> Option<usize> {
     let snapshot = ui.snapshot.as_ref()?;
-    let mut row_top = INTERFACE_START_Y + 18;
+    let left_width = interface_panel_width(width);
+    if x < MARGIN || x > MARGIN + left_width {
+        return None;
+    }
+
+    let mut row_top = ROWS_Y;
     for row in 0..snapshot.interfaces.len() {
         if y >= row_top && y < row_top + TOUCH_ROW_HEIGHT {
             return Some(row);
@@ -349,14 +369,13 @@ fn hit_test(_x: c_int, y: c_int, ui: &UiState) -> Option<usize> {
 }
 
 fn hit_retry(x: c_int, y: c_int, width: i32) -> bool {
-    let button_width = ((width - MARGIN * 2 - 24) / 2).max(160);
-    x >= MARGIN && x <= MARGIN + button_width && y >= BUTTON_Y && y <= BUTTON_Y + BUTTON_HEIGHT
+    let (retry_x, _, button_width) = button_layout(width);
+    x >= retry_x && x <= retry_x + button_width && y >= BUTTON_Y && y <= BUTTON_Y + BUTTON_HEIGHT
 }
 
 fn hit_quit(x: c_int, y: c_int, width: i32) -> bool {
-    let button_width = ((width - MARGIN * 2 - 24) / 2).max(160);
-    let x0 = MARGIN + button_width + 24;
-    x >= x0 && x <= x0 + button_width && y >= BUTTON_Y && y <= BUTTON_Y + BUTTON_HEIGHT
+    let (_, quit_x, button_width) = button_layout(width);
+    x >= quit_x && x <= quit_x + button_width && y >= BUTTON_Y && y <= BUTTON_Y + BUTTON_HEIGHT
 }
 
 fn draw(
@@ -364,24 +383,24 @@ fn draw(
     window: xlib::Window,
     gc: xlib::GC,
     width: i32,
-    _height: i32,
+    height: i32,
     ui: &UiState,
 ) -> io::Result<()> {
     unsafe {
         xlib::XClearWindow(display, window);
-        set_white(display, gc);
-        draw_text(display, window, gc, MARGIN, 56, "KubuntuLLDP");
-        draw_text(
-            display,
-            window,
-            gc,
-            MARGIN,
-            94,
-            "Interface picker and live state",
-        );
+        draw_header(display, window, gc, width);
 
         if let Some(error) = &ui.error {
-            draw_text(display, window, gc, MARGIN, 134, &format!("Error: {error}"));
+            draw_status_card(
+                display,
+                window,
+                gc,
+                MARGIN,
+                STATUS_Y,
+                width - MARGIN * 2,
+                "Agent error",
+                error,
+            );
         }
 
         let Some(snapshot) = &ui.snapshot else {
@@ -390,57 +409,23 @@ fn draw(
                 window,
                 gc,
                 MARGIN,
-                156,
+                STATUS_Y,
                 width - MARGIN * 2,
-                BUTTON_HEIGHT,
+                STATUS_CARD_HEIGHT,
                 "Waiting for agent",
             );
             return Ok(());
         };
 
         let selected = snapshot.selected_interface.as_deref().unwrap_or("none");
-        draw_text(
-            display,
-            window,
-            gc,
-            MARGIN,
-            134,
-            &format!("Selected interface: {selected}"),
-        );
-        draw_text(
-            display,
-            window,
-            gc,
-            MARGIN,
-            166,
-            &format!("Discovery: {}", snapshot.discovery_status),
-        );
-        draw_text(
-            display,
-            window,
-            gc,
-            MARGIN,
-            198,
-            &format!("DHCP: {}", snapshot.dhcp_status),
-        );
-        draw_text(
-            display,
-            window,
-            gc,
-            MARGIN,
-            230,
-            &format!(
-                "Last error: {}",
-                snapshot.last_error.as_deref().unwrap_or("none")
-            ),
-        );
+        draw_status_cards(display, window, gc, width, snapshot, selected);
 
-        let button_width = ((width - MARGIN * 2 - 24) / 2).max(160);
+        let (retry_x, quit_x, button_width) = button_layout(width);
         draw_button(
             display,
             window,
             gc,
-            MARGIN,
+            retry_x,
             BUTTON_Y,
             button_width,
             BUTTON_HEIGHT,
@@ -450,85 +435,381 @@ fn draw(
             display,
             window,
             gc,
-            MARGIN + button_width + 24,
+            quit_x,
             BUTTON_Y,
             button_width,
             BUTTON_HEIGHT,
             "Quit",
         );
 
-        let mut y = INTERFACE_START_Y;
-        draw_text(display, window, gc, MARGIN, y, "Interfaces");
-        y += 18;
-        for iface in &snapshot.interfaces {
-            let marker = if iface.is_selected { "*" } else { " " };
-            let line = format!(
-                "{marker} {:<16} {:<7} mac={} ip={}",
-                iface.name,
-                format_state(&iface.state),
-                iface.mac_address.as_deref().unwrap_or("n/a"),
-                iface.ip_address.as_deref().unwrap_or("n/a"),
-            );
+        let left_width = interface_panel_width(width);
+        let right_x = MARGIN + left_width + GUTTER;
+        let right_width = (width - right_x - MARGIN).max(260);
+        let panel_bottom = height - MARGIN;
+        let panel_height = (panel_bottom - MAIN_Y).max(280);
+        draw_panel(
+            display,
+            window,
+            gc,
+            MARGIN,
+            MAIN_Y,
+            left_width,
+            panel_height,
+            "Interfaces",
+        );
 
-            draw_touch_row(
-                display,
-                window,
-                gc,
-                MARGIN,
-                y,
-                width - MARGIN * 2,
-                TOUCH_ROW_HEIGHT,
-                iface.is_selected,
-            );
-            draw_text(display, window, gc, MARGIN + 24, y + 44, &line);
-            set_white(display, gc);
+        let mut y = ROWS_Y;
+        for iface in &snapshot.interfaces {
+            draw_interface_row(display, window, gc, MARGIN + 16, y, left_width - 32, iface);
             y += TOUCH_ROW_HEIGHT + TOUCH_ROW_GAP;
         }
 
-        y += 20;
-        draw_text(display, window, gc, MARGIN, y, "Neighbors");
-        y += LINE_HEIGHT;
-        if snapshot.neighbors.is_empty() {
-            draw_text(display, window, gc, MARGIN, y, "none yet");
-            y += LINE_HEIGHT;
-        } else {
-            for neighbor in &snapshot.neighbors {
-                let line = format!(
-                    "{:?} chassis={} port={} system={}",
-                    neighbor.protocol,
-                    neighbor.chassis_id.as_deref().unwrap_or("n/a"),
-                    neighbor.port_id.as_deref().unwrap_or("n/a"),
-                    neighbor.system_name.as_deref().unwrap_or("n/a")
-                );
-                draw_text(display, window, gc, MARGIN, y, &line);
-                y += LINE_HEIGHT;
-            }
-        }
+        let right_panel_gap = GUTTER;
+        let right_panel_height = ((panel_height - right_panel_gap) / 2).max(180);
+        draw_panel(
+            display,
+            window,
+            gc,
+            right_x,
+            MAIN_Y,
+            right_width,
+            right_panel_height,
+            "LLDP / CDP Neighbor",
+        );
+        draw_neighbors(
+            display,
+            window,
+            gc,
+            right_x + 18,
+            MAIN_Y + PANEL_HEADER_HEIGHT + 34,
+            right_width - 36,
+            snapshot,
+        );
 
-        y += 20;
-        draw_text(display, window, gc, MARGIN, y, "DHCP options");
-        y += LINE_HEIGHT;
-        if snapshot.dhcp_options.is_empty() {
-            draw_text(display, window, gc, MARGIN, y, "none yet");
-        } else {
-            for option in &snapshot.dhcp_options {
-                let code = option
-                    .code
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "-".to_string());
-                draw_text(
-                    display,
-                    window,
-                    gc,
-                    MARGIN,
-                    y,
-                    &format!("option {code} {} = {}", option.name, option.value),
-                );
-                y += LINE_HEIGHT;
-            }
-        }
+        let dhcp_y = MAIN_Y + right_panel_height + right_panel_gap;
+        draw_panel(
+            display,
+            window,
+            gc,
+            right_x,
+            dhcp_y,
+            right_width,
+            panel_bottom - dhcp_y,
+            "DHCP Options",
+        );
+        draw_dhcp_options(
+            display,
+            window,
+            gc,
+            right_x + 18,
+            dhcp_y + PANEL_HEADER_HEIGHT + 34,
+            right_width - 36,
+            snapshot,
+        );
     }
     Ok(())
+}
+
+fn draw_header(display: *mut xlib::Display, window: xlib::Window, gc: xlib::GC, width: i32) {
+    unsafe {
+        set_white(display, gc);
+        xlib::XFillRectangle(
+            display,
+            window,
+            gc,
+            0,
+            0,
+            width as u32,
+            HEADER_HEIGHT as u32,
+        );
+        set_black(display, gc);
+        draw_text(display, window, gc, MARGIN, 48, "KubuntuLLDP");
+        draw_text(display, window, gc, MARGIN, 86, "Link discovery console");
+        set_white(display, gc);
+    }
+}
+
+fn draw_status_cards(
+    display: *mut xlib::Display,
+    window: xlib::Window,
+    gc: xlib::GC,
+    width: i32,
+    snapshot: &RuntimeSnapshot,
+    selected: &str,
+) {
+    let card_gap = 18;
+    let card_width = ((width - MARGIN * 2 - card_gap * 3) / 4).max(180);
+    let mut x = MARGIN;
+    draw_status_card(
+        display, window, gc, x, STATUS_Y, card_width, "Selected", selected,
+    );
+    x += card_width + card_gap;
+    draw_status_card(
+        display,
+        window,
+        gc,
+        x,
+        STATUS_Y,
+        card_width,
+        "Discovery",
+        &snapshot.discovery_status,
+    );
+    x += card_width + card_gap;
+    draw_status_card(
+        display,
+        window,
+        gc,
+        x,
+        STATUS_Y,
+        card_width,
+        "DHCP",
+        &snapshot.dhcp_status,
+    );
+    x += card_width + card_gap;
+    draw_status_card(
+        display,
+        window,
+        gc,
+        x,
+        STATUS_Y,
+        width - x - MARGIN,
+        "Last error",
+        snapshot.last_error.as_deref().unwrap_or("none"),
+    );
+}
+
+fn draw_neighbors(
+    display: *mut xlib::Display,
+    window: xlib::Window,
+    gc: xlib::GC,
+    x: i32,
+    mut y: i32,
+    width: i32,
+    snapshot: &RuntimeSnapshot,
+) {
+    set_white(display, gc);
+    if snapshot.neighbors.is_empty() {
+        draw_text(display, window, gc, x, y, "No neighbor discovered yet");
+        return;
+    }
+
+    for neighbor in &snapshot.neighbors {
+        draw_text(
+            display,
+            window,
+            gc,
+            x,
+            y,
+            &fit_text(
+                &format!(
+                    "{:?}  system {}",
+                    neighbor.protocol,
+                    neighbor.system_name.as_deref().unwrap_or("n/a")
+                ),
+                width,
+            ),
+        );
+        y += LINE_HEIGHT;
+        draw_text(
+            display,
+            window,
+            gc,
+            x,
+            y,
+            &fit_text(
+                &format!(
+                    "Port {}  Chassis {}",
+                    neighbor.port_id.as_deref().unwrap_or("n/a"),
+                    neighbor.chassis_id.as_deref().unwrap_or("n/a"),
+                ),
+                width,
+            ),
+        );
+        y += LINE_HEIGHT + 18;
+    }
+}
+
+fn draw_dhcp_options(
+    display: *mut xlib::Display,
+    window: xlib::Window,
+    gc: xlib::GC,
+    x: i32,
+    mut y: i32,
+    width: i32,
+    snapshot: &RuntimeSnapshot,
+) {
+    set_white(display, gc);
+    if snapshot.dhcp_options.is_empty() {
+        draw_text(display, window, gc, x, y, "No DHCP options reported yet");
+        return;
+    }
+
+    for option in &snapshot.dhcp_options {
+        let code = option
+            .code
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        draw_text(
+            display,
+            window,
+            gc,
+            x,
+            y,
+            &fit_text(
+                &format!("option {code}  {} = {}", option.name, option.value),
+                width,
+            ),
+        );
+        y += LINE_HEIGHT;
+    }
+}
+
+fn draw_panel(
+    display: *mut xlib::Display,
+    window: xlib::Window,
+    gc: xlib::GC,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    title: &str,
+) {
+    unsafe {
+        set_white(display, gc);
+        xlib::XDrawRectangle(display, window, gc, x, y, width as u32, height as u32);
+        xlib::XFillRectangle(
+            display,
+            window,
+            gc,
+            x,
+            y,
+            width as u32,
+            PANEL_HEADER_HEIGHT as u32,
+        );
+        set_black(display, gc);
+        draw_text(display, window, gc, x + 18, y + 36, title);
+        set_white(display, gc);
+    }
+}
+
+fn draw_status_card(
+    display: *mut xlib::Display,
+    window: xlib::Window,
+    gc: xlib::GC,
+    x: i32,
+    y: i32,
+    width: i32,
+    label: &str,
+    value: &str,
+) {
+    unsafe {
+        set_white(display, gc);
+        xlib::XFillRectangle(
+            display,
+            window,
+            gc,
+            x,
+            y,
+            width as u32,
+            STATUS_CARD_HEIGHT as u32,
+        );
+        set_black(display, gc);
+        draw_text(display, window, gc, x + 18, y + 30, label);
+        draw_text(
+            display,
+            window,
+            gc,
+            x + 18,
+            y + 64,
+            &fit_text(value, width - 36),
+        );
+        set_white(display, gc);
+    }
+}
+
+fn draw_interface_row(
+    display: *mut xlib::Display,
+    window: xlib::Window,
+    gc: xlib::GC,
+    x: i32,
+    y: i32,
+    width: i32,
+    iface: &kubuntu_lldp_core::InterfaceSnapshot,
+) {
+    unsafe {
+        if iface.is_selected {
+            set_white(display, gc);
+            xlib::XFillRectangle(
+                display,
+                window,
+                gc,
+                x,
+                y,
+                width as u32,
+                TOUCH_ROW_HEIGHT as u32,
+            );
+            set_black(display, gc);
+        } else {
+            set_white(display, gc);
+            xlib::XDrawRectangle(
+                display,
+                window,
+                gc,
+                x,
+                y,
+                width as u32,
+                TOUCH_ROW_HEIGHT as u32,
+            );
+        }
+
+        let title = format!("{}  {}", iface.name, format_state(&iface.state));
+        let detail = format!(
+            "MAC {}   IP {}",
+            iface.mac_address.as_deref().unwrap_or("n/a"),
+            iface.ip_address.as_deref().unwrap_or("n/a"),
+        );
+        draw_text(
+            display,
+            window,
+            gc,
+            x + 18,
+            y + 34,
+            &fit_text(&title, width - 36),
+        );
+        draw_text(
+            display,
+            window,
+            gc,
+            x + 18,
+            y + 66,
+            &fit_text(&detail, width - 36),
+        );
+        set_white(display, gc);
+    }
+}
+
+fn interface_panel_width(width: i32) -> i32 {
+    let available = width - MARGIN * 2 - GUTTER;
+    ((available * 45) / 100).max(420).min(available - 320)
+}
+
+fn button_layout(width: i32) -> (i32, i32, i32) {
+    let button_width = ((width - MARGIN * 2 - GUTTER) / 2).max(220);
+    let retry_x = MARGIN;
+    let quit_x = MARGIN + button_width + GUTTER;
+    (retry_x, quit_x, button_width)
+}
+
+fn fit_text(text: &str, width: i32) -> String {
+    let max_chars = (width / 12).max(8) as usize;
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+
+    let keep = max_chars.saturating_sub(3);
+    let mut value: String = text.chars().take(keep).collect();
+    value.push_str("...");
+    value
 }
 
 fn draw_button(
@@ -546,25 +827,6 @@ fn draw_button(
         set_black(display, gc);
         draw_text(display, window, gc, x + 24, y + 40, label);
         set_white(display, gc);
-    }
-}
-
-fn draw_touch_row(
-    display: *mut xlib::Display,
-    window: xlib::Window,
-    gc: xlib::GC,
-    x: i32,
-    y: i32,
-    width: i32,
-    height: i32,
-    selected: bool,
-) {
-    if !selected {
-        return;
-    }
-    unsafe {
-        xlib::XFillRectangle(display, window, gc, x, y, width as u32, height as u32);
-        set_black(display, gc);
     }
 }
 

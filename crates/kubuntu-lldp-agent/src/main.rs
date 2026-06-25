@@ -232,6 +232,8 @@ fn handle_connection(mut stream: UnixStream, state: Arc<Mutex<AgentState>>) -> i
 fn select_interface(state: &Arc<Mutex<AgentState>>, name: String) {
     if let Ok(mut guard) = state.lock() {
         guard.selected_interface = Some(name);
+        guard.neighbors.clear();
+        guard.dhcp_options.clear();
         guard.desired_generation = guard.desired_generation.wrapping_add(1);
         guard.running_generation = None;
         guard.completed_generation = None;
