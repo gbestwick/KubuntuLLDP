@@ -481,7 +481,7 @@ fn draw(
             window,
             gc,
             right_x + 18,
-            MAIN_Y + PANEL_HEADER_HEIGHT + 34,
+            MAIN_Y + PANEL_HEADER_HEIGHT + 30,
             right_width - 36,
             snapshot,
         );
@@ -594,36 +594,131 @@ fn draw_neighbors(
     }
 
     for neighbor in &snapshot.neighbors {
-        draw_text(
+        draw_field(
             display,
             window,
             gc,
             x,
             y,
-            &fit_text(
-                &format!(
-                    "{:?}  system {}",
-                    neighbor.protocol,
-                    neighbor.system_name.as_deref().unwrap_or("n/a")
-                ),
-                width,
-            ),
+            width,
+            "Protocol",
+            protocol_name(&neighbor.protocol),
         );
         y += LINE_HEIGHT;
-        draw_text(
+        draw_field(
             display,
             window,
             gc,
             x,
             y,
-            &fit_text(
-                &format!(
-                    "Port {}  Chassis {}",
-                    neighbor.port_id.as_deref().unwrap_or("n/a"),
-                    neighbor.chassis_id.as_deref().unwrap_or("n/a"),
-                ),
-                width,
-            ),
+            width,
+            "Device name",
+            neighbor.system_name.as_deref().unwrap_or("n/a"),
+        );
+        y += LINE_HEIGHT;
+        draw_field(
+            display,
+            window,
+            gc,
+            x,
+            y,
+            width,
+            "Description",
+            neighbor.system_description.as_deref().unwrap_or("n/a"),
+        );
+        y += LINE_HEIGHT;
+        draw_field(
+            display,
+            window,
+            gc,
+            x,
+            y,
+            width,
+            "Chassis ID",
+            neighbor.chassis_id.as_deref().unwrap_or("n/a"),
+        );
+        y += LINE_HEIGHT;
+        draw_field(
+            display,
+            window,
+            gc,
+            x,
+            y,
+            width,
+            "Remote port",
+            neighbor.port_id.as_deref().unwrap_or("n/a"),
+        );
+        y += LINE_HEIGHT;
+        draw_field(
+            display,
+            window,
+            gc,
+            x,
+            y,
+            width,
+            "Port description",
+            neighbor.port_description.as_deref().unwrap_or("n/a"),
+        );
+        y += LINE_HEIGHT;
+        draw_field(
+            display,
+            window,
+            gc,
+            x,
+            y,
+            width,
+            "Management IP",
+            &display_list(&neighbor.management_addresses),
+        );
+        y += LINE_HEIGHT;
+        draw_field(
+            display,
+            window,
+            gc,
+            x,
+            y,
+            width,
+            "Capabilities",
+            &display_list(&neighbor.capabilities),
+        );
+        y += LINE_HEIGHT;
+        draw_field(
+            display,
+            window,
+            gc,
+            x,
+            y,
+            width,
+            "TTL",
+            &neighbor
+                .ttl_seconds
+                .map(|ttl| format!("{ttl} seconds"))
+                .unwrap_or_else(|| "n/a".to_string()),
+        );
+        y += LINE_HEIGHT;
+        draw_field(
+            display,
+            window,
+            gc,
+            x,
+            y,
+            width,
+            "Native VLAN",
+            &neighbor
+                .native_vlan
+                .map(|vlan| vlan.to_string())
+                .unwrap_or_else(|| "n/a".to_string()),
+        );
+        y += LINE_HEIGHT;
+        draw_field(
+            display,
+            window,
+            gc,
+            x,
+            y,
+            width,
+            "Duplex",
+            neighbor.duplex.as_deref().unwrap_or("n/a"),
         );
         y += LINE_HEIGHT + 18;
     }
@@ -812,6 +907,43 @@ fn fit_text(text: &str, width: i32) -> String {
     value
 }
 
+fn draw_field(
+    display: *mut xlib::Display,
+    window: xlib::Window,
+    gc: xlib::GC,
+    x: i32,
+    y: i32,
+    width: i32,
+    label: &str,
+    value: &str,
+) {
+    let label_width = 190;
+    draw_text(display, window, gc, x, y, label);
+    draw_text(
+        display,
+        window,
+        gc,
+        x + label_width,
+        y,
+        &fit_text(value, width - label_width),
+    );
+}
+
+fn display_list(values: &[String]) -> String {
+    if values.is_empty() {
+        "n/a".to_string()
+    } else {
+        values.join(", ")
+    }
+}
+
+fn protocol_name(protocol: &kubuntu_lldp_core::DiscoveryProtocol) -> &'static str {
+    match protocol {
+        kubuntu_lldp_core::DiscoveryProtocol::Cdp => "CDP",
+        kubuntu_lldp_core::DiscoveryProtocol::Lldp => "LLDP",
+    }
+}
+
 fn draw_button(
     display: *mut xlib::Display,
     window: xlib::Window,
@@ -874,6 +1006,9 @@ fn draw_text(
 
 fn load_large_font(display: *mut xlib::Display) -> Option<*mut xlib::XFontStruct> {
     let candidates = [
+        "-misc-dejavu sans-medium-r-normal--24-0-0-0-p-0-iso10646-1",
+        "-misc-ubuntu sans-medium-r-normal--24-0-0-0-p-0-iso10646-1",
+        "-misc-noto sans-medium-r-normal--24-0-0-0-p-0-iso10646-1",
         "12x24",
         "10x20",
         "9x15bold",

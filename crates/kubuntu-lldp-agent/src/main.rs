@@ -383,7 +383,11 @@ fn set_phase_error(state: &Arc<Mutex<AgentState>>, generation: u64, which: &str,
     }
 }
 
-fn update_neighbors(state: &Arc<Mutex<AgentState>>, generation: u64, neighbors: Vec<NeighborRecord>) {
+fn update_neighbors(
+    state: &Arc<Mutex<AgentState>>,
+    generation: u64,
+    neighbors: Vec<NeighborRecord>,
+) {
     if let Ok(mut guard) = state.lock() {
         if guard.desired_generation != generation {
             return;
@@ -465,7 +469,9 @@ fn read_ipv4_address(name: &str) -> io::Result<Option<String>> {
     let tokens: Vec<_> = stdout.split_whitespace().collect();
     for window in tokens.windows(2) {
         if window[0] == "inet" {
-            return Ok(Some(window[1].split('/').next().unwrap_or(window[1]).to_string()));
+            return Ok(Some(
+                window[1].split('/').next().unwrap_or(window[1]).to_string(),
+            ));
         }
     }
 
@@ -490,26 +496,23 @@ fn capture_neighbors(
 
     let mut command = Command::new("tcpdump");
     command
-            .args([
-                "-i",
-                interface,
-                "-Q",
-                "in",
-                "-U",
-                "-w",
-                "-",
-                "-s",
-                "2048",
-                "-c",
-                "1",
-                "ether proto 0x88cc or ether[20:2] = 0x2000",
-            ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-    let output = run_command_with_timeout(
-        &mut command,
-        DISCOVERY_CAPTURE_TIMEOUT,
-    )?;
+        .args([
+            "-i",
+            interface,
+            "-Q",
+            "in",
+            "-U",
+            "-w",
+            "-",
+            "-s",
+            "2048",
+            "-c",
+            "1",
+            "ether proto 0x88cc or ether[20:2] = 0x2000",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = run_command_with_timeout(&mut command, DISCOVERY_CAPTURE_TIMEOUT)?;
 
     if output.stdout.is_empty() {
         return Err(io::Error::new(
@@ -544,7 +547,11 @@ fn filter_local_neighbors(
             neighbor
                 .chassis_id
                 .as_deref()
-                .map(|chassis_id| !local_macs.iter().any(|mac| mac == &chassis_id.to_ascii_lowercase()))
+                .map(|chassis_id| {
+                    !local_macs
+                        .iter()
+                        .any(|mac| mac == &chassis_id.to_ascii_lowercase())
+                })
                 .unwrap_or(true)
         })
         .collect()
@@ -569,8 +576,14 @@ fn unique_neighbors(neighbors: Vec<NeighborRecord>) -> Vec<NeighborRecord> {
             existing.protocol == neighbor.protocol
                 && existing.chassis_id == neighbor.chassis_id
                 && existing.port_id == neighbor.port_id
+                && existing.port_description == neighbor.port_description
                 && existing.system_name == neighbor.system_name
                 && existing.system_description == neighbor.system_description
+                && existing.management_addresses == neighbor.management_addresses
+                && existing.capabilities == neighbor.capabilities
+                && existing.ttl_seconds == neighbor.ttl_seconds
+                && existing.native_vlan == neighbor.native_vlan
+                && existing.duplex == neighbor.duplex
         });
         if !duplicate {
             unique.push(neighbor);
@@ -642,8 +655,14 @@ fn parse_ethernet_frame(frame: &[u8]) -> Option<NeighborRecord> {
 fn parse_lldp(payload: &[u8]) -> Option<NeighborRecord> {
     let mut chassis_id = None;
     let mut port_id = None;
+    let mut port_description = None;
     let mut system_name = None;
     let mut system_description = None;
+    let mut management_addresses = Vec::new();
+    let mut capabilities = Vec::new();
+    let mut ttl_seconds = None;
+    let mut native_vlan = None;
+    let mut duplex = None;
     let mut offset = 0usize;
 
     while offset + 2 <= payload.len() {
@@ -661,8 +680,17 @@ fn parse_lldp(payload: &[u8]) -> Option<NeighborRecord> {
         match tlv_type {
             1 => chassis_id = decode_lldp_identity(value),
             2 => port_id = decode_lldp_identity(value),
+            3 if value.len() >= 2 => ttl_seconds = Some(u16::from_be_bytes([value[0], value[1]])),
+            4 => port_description = bytes_to_string(value),
             5 => system_name = bytes_to_string(value),
             6 => system_description = bytes_to_string(value),
+            7 => capabilities = decode_lldp_capabilities(value),
+            8 => {
+                if let Some(address) = decode_lldp_management_address(value) {
+                    management_addresses.push(address);
+                }
+            }
+            127 => decode_lldp_org_tlv(value, &mut native_vlan, &mut duplex),
             _ => {}
         }
         offset += tlv_len;
@@ -670,8 +698,10 @@ fn parse_lldp(payload: &[u8]) -> Option<NeighborRecord> {
 
     if chassis_id.is_none()
         && port_id.is_none()
+        && port_description.is_none()
         && system_name.is_none()
         && system_description.is_none()
+        && management_addresses.is_empty()
     {
         return None;
     }
@@ -680,8 +710,14 @@ fn parse_lldp(payload: &[u8]) -> Option<NeighborRecord> {
         protocol: DiscoveryProtocol::Lldp,
         chassis_id,
         port_id,
+        port_description,
         system_name,
         system_description,
+        management_addresses,
+        capabilities,
+        ttl_seconds,
+        native_vlan,
+        duplex,
     })
 }
 
@@ -691,9 +727,13 @@ fn parse_cdp(payload: &[u8]) -> Option<NeighborRecord> {
     }
 
     let mut device_id = None;
+    let mut addresses = Vec::new();
+    let mut capabilities = Vec::new();
     let mut port_id = None;
     let mut software = None;
     let mut platform = None;
+    let mut native_vlan = None;
+    let mut duplex = None;
     let mut offset = 4usize;
 
     while offset + 4 <= payload.len() {
@@ -705,9 +745,21 @@ fn parse_cdp(payload: &[u8]) -> Option<NeighborRecord> {
         let value = &payload[offset + 4..offset + tlv_len];
         match tlv_type {
             0x0001 => device_id = bytes_to_string(value),
+            0x0002 => addresses.extend(decode_cdp_addresses(value)),
             0x0003 => port_id = bytes_to_string(value),
+            0x0004 => capabilities = decode_cdp_capabilities(value),
             0x0005 => software = bytes_to_string(value),
             0x0006 => platform = bytes_to_string(value),
+            0x000a if value.len() >= 2 => {
+                native_vlan = Some(u16::from_be_bytes([value[0], value[1]]))
+            }
+            0x000b if !value.is_empty() => {
+                duplex = Some(match value[0] {
+                    1 => "half".to_string(),
+                    2 => "full".to_string(),
+                    other => format!("unknown ({other})"),
+                })
+            }
             _ => {}
         }
         offset += tlv_len;
@@ -721,6 +773,7 @@ fn parse_cdp(payload: &[u8]) -> Option<NeighborRecord> {
         protocol: DiscoveryProtocol::Cdp,
         chassis_id: device_id.clone(),
         port_id,
+        port_description: None,
         system_name: device_id,
         system_description: match (software, platform) {
             (Some(software), Some(platform)) => Some(format!("{software} | {platform}")),
@@ -728,7 +781,170 @@ fn parse_cdp(payload: &[u8]) -> Option<NeighborRecord> {
             (None, Some(platform)) => Some(platform),
             (None, None) => None,
         },
+        management_addresses: addresses,
+        capabilities,
+        ttl_seconds: Some(payload[1] as u16),
+        native_vlan,
+        duplex,
     })
+}
+
+fn decode_lldp_capabilities(value: &[u8]) -> Vec<String> {
+    if value.len() < 4 {
+        return Vec::new();
+    }
+    let enabled = u16::from_be_bytes([value[2], value[3]]);
+    decode_capability_bits(
+        enabled,
+        &[
+            (0, "Other"),
+            (1, "Repeater"),
+            (2, "Bridge"),
+            (3, "WLAN access point"),
+            (4, "Router"),
+            (5, "Telephone"),
+            (6, "DOCSIS cable device"),
+            (7, "Station only"),
+            (8, "C-VLAN component"),
+            (9, "S-VLAN component"),
+            (10, "Two-port MAC relay"),
+        ],
+    )
+}
+
+fn decode_lldp_management_address(value: &[u8]) -> Option<String> {
+    if value.len() < 2 {
+        return None;
+    }
+    let address_len = value[0] as usize;
+    if address_len < 2 || value.len() < 1 + address_len {
+        return None;
+    }
+    let subtype = value[1];
+    let address = &value[2..1 + address_len];
+    match subtype {
+        1 if address.len() == 4 => Some(format!(
+            "{}.{}.{}.{}",
+            address[0], address[1], address[2], address[3]
+        )),
+        2 if address.len() == 16 => Some(
+            address
+                .chunks(2)
+                .map(|chunk| format!("{:02x}{:02x}", chunk[0], chunk[1]))
+                .collect::<Vec<_>>()
+                .join(":"),
+        ),
+        _ => Some(bytes_to_hex(address)),
+    }
+}
+
+fn decode_lldp_org_tlv(value: &[u8], native_vlan: &mut Option<u16>, duplex: &mut Option<String>) {
+    if value.len() < 4 {
+        return;
+    }
+    let oui = &value[0..3];
+    let subtype = value[3];
+    let payload = &value[4..];
+    if oui == [0x00, 0x80, 0xc2] && subtype == 1 && payload.len() >= 2 {
+        *native_vlan = Some(u16::from_be_bytes([payload[0], payload[1]]));
+    }
+    if oui == [0x00, 0x12, 0xbb] && subtype == 3 && payload.len() >= 2 {
+        *native_vlan = Some(u16::from_be_bytes([payload[0], payload[1]]));
+    }
+    if oui == [0x00, 0x12, 0xbb] && subtype == 4 && !payload.is_empty() {
+        *duplex = Some(match payload[0] {
+            0 => "unknown".to_string(),
+            1 => "half".to_string(),
+            2 => "full".to_string(),
+            other => format!("unknown ({other})"),
+        });
+    }
+    if oui == [0x00, 0x12, 0x0f] && subtype == 1 && payload.len() >= 5 {
+        let mau_type = u16::from_be_bytes([payload[3], payload[4]]);
+        *duplex = Some(decode_mau_type(mau_type));
+    }
+}
+
+fn decode_mau_type(mau_type: u16) -> String {
+    match mau_type {
+        0 => "unknown".to_string(),
+        5 => "10Base-T half duplex".to_string(),
+        6 => "10Base-T full duplex".to_string(),
+        15 => "100Base-TX half duplex".to_string(),
+        16 => "100Base-TX full duplex".to_string(),
+        29 => "1000Base-T half duplex".to_string(),
+        30 => "1000Base-T full duplex".to_string(),
+        31 => "10GBase-T".to_string(),
+        other => format!("MAU type {other}"),
+    }
+}
+
+fn decode_cdp_addresses(value: &[u8]) -> Vec<String> {
+    if value.len() < 4 {
+        return Vec::new();
+    }
+    let count = u32::from_be_bytes([value[0], value[1], value[2], value[3]]) as usize;
+    let mut offset = 4usize;
+    let mut addresses = Vec::new();
+    for _ in 0..count {
+        if offset + 2 > value.len() {
+            break;
+        }
+        let protocol_type = value[offset];
+        let protocol_len = value[offset + 1] as usize;
+        offset += 2;
+        if offset + protocol_len + 2 > value.len() {
+            break;
+        }
+        let protocol = &value[offset..offset + protocol_len];
+        offset += protocol_len;
+        let address_len = u16::from_be_bytes([value[offset], value[offset + 1]]) as usize;
+        offset += 2;
+        if offset + address_len > value.len() {
+            break;
+        }
+        let address = &value[offset..offset + address_len];
+        offset += address_len;
+        if protocol_type == 1 && protocol == [0xcc] && address.len() == 4 {
+            addresses.push(format!(
+                "{}.{}.{}.{}",
+                address[0], address[1], address[2], address[3]
+            ));
+        } else if !address.is_empty() {
+            addresses.push(bytes_to_hex(address));
+        }
+    }
+    addresses
+}
+
+fn decode_cdp_capabilities(value: &[u8]) -> Vec<String> {
+    if value.len() < 4 {
+        return Vec::new();
+    }
+    let bits = u32::from_be_bytes([value[0], value[1], value[2], value[3]]) as u16;
+    decode_capability_bits(
+        bits,
+        &[
+            (0, "Router"),
+            (1, "Transparent bridge"),
+            (2, "Source-route bridge"),
+            (3, "Switch"),
+            (4, "Host"),
+            (5, "IGMP capable"),
+            (6, "Repeater"),
+            (7, "VoIP phone"),
+            (8, "Remote managed"),
+            (9, "CVTA"),
+        ],
+    )
+}
+
+fn decode_capability_bits(bits: u16, labels: &[(u8, &str)]) -> Vec<String> {
+    labels
+        .iter()
+        .filter(|(bit, _)| bits & (1 << bit) != 0)
+        .map(|(_, label)| (*label).to_string())
+        .collect()
 }
 
 fn decode_lldp_identity(value: &[u8]) -> Option<String> {
@@ -771,10 +987,7 @@ fn run_dhcp_client(interface: &str) -> io::Result<Vec<DhcpOptionRecord>> {
         .args(["-4", "-v", "-1", interface])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let output = run_command_with_timeout(
-        &mut command,
-        DHCP_TIMEOUT,
-    )?;
+    let output = run_command_with_timeout(&mut command, DHCP_TIMEOUT)?;
 
     if !output.status.success() {
         return Err(io::Error::new(
@@ -785,7 +998,11 @@ fn run_dhcp_client(interface: &str) -> io::Result<Vec<DhcpOptionRecord>> {
 
     let mut options = parse_dhcp_output(&output.stdout);
     options.extend(parse_dhcp_leases(interface));
-    options.sort_by(|left, right| left.name.cmp(&right.name).then(left.value.cmp(&right.value)));
+    options.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then(left.value.cmp(&right.value))
+    });
     options.dedup();
     Ok(options)
 }

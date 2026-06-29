@@ -29,8 +29,14 @@ pub struct NeighborRecord {
     pub protocol: DiscoveryProtocol,
     pub chassis_id: Option<String>,
     pub port_id: Option<String>,
+    pub port_description: Option<String>,
     pub system_name: Option<String>,
     pub system_description: Option<String>,
+    pub management_addresses: Vec<String>,
+    pub capabilities: Vec<String>,
+    pub ttl_seconds: Option<u16>,
+    pub native_vlan: Option<u16>,
+    pub duplex: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,9 +135,21 @@ pub fn encode_response(response: &AgentResponse) -> String {
                 out.push('|');
                 push_optional_field(&mut out, neighbor.port_id.as_deref());
                 out.push('|');
+                push_optional_field(&mut out, neighbor.port_description.as_deref());
+                out.push('|');
                 push_optional_field(&mut out, neighbor.system_name.as_deref());
                 out.push('|');
                 push_optional_field(&mut out, neighbor.system_description.as_deref());
+                out.push('|');
+                push_list_field(&mut out, &neighbor.management_addresses);
+                out.push('|');
+                push_list_field(&mut out, &neighbor.capabilities);
+                out.push('|');
+                push_optional_u16(&mut out, neighbor.ttl_seconds);
+                out.push('|');
+                push_optional_u16(&mut out, neighbor.native_vlan);
+                out.push('|');
+                push_optional_field(&mut out, neighbor.duplex.as_deref());
                 out.push('\n');
             }
 
@@ -233,7 +251,7 @@ pub fn decode_response(text: &str) -> Result<AgentResponse, String> {
                 is_selected: parts[4] == "1",
             });
         } else if let Some(payload) = line.strip_prefix("neighbor=") {
-            let parts = split_escaped(payload, 5)?;
+            let parts = split_escaped(payload, 11)?;
             let protocol = match parts[0].as_str() {
                 "cdp" => DiscoveryProtocol::Cdp,
                 _ => DiscoveryProtocol::Lldp,
@@ -250,15 +268,29 @@ pub fn decode_response(text: &str) -> Result<AgentResponse, String> {
                 } else {
                     Some(parts[2].clone())
                 },
-                system_name: if parts[3] == "-" {
+                port_description: if parts[3] == "-" {
                     None
                 } else {
                     Some(parts[3].clone())
                 },
-                system_description: if parts[4] == "-" {
+                system_name: if parts[4] == "-" {
                     None
                 } else {
                     Some(parts[4].clone())
+                },
+                system_description: if parts[5] == "-" {
+                    None
+                } else {
+                    Some(parts[5].clone())
+                },
+                management_addresses: decode_list_field(&parts[6])?,
+                capabilities: decode_list_field(&parts[7])?,
+                ttl_seconds: decode_optional_u16(&parts[8])?,
+                native_vlan: decode_optional_u16(&parts[9])?,
+                duplex: if parts[10] == "-" {
+                    None
+                } else {
+                    Some(parts[10].clone())
                 },
             });
         } else if let Some(payload) = line.strip_prefix("dhcp=") {
@@ -376,5 +408,79 @@ fn push_optional_code(out: &mut String, value: Option<u8>) {
     match value {
         Some(value) => out.push_str(&value.to_string()),
         None => out.push('-'),
+    }
+}
+
+fn push_optional_u16(out: &mut String, value: Option<u16>) {
+    match value {
+        Some(value) => out.push_str(&value.to_string()),
+        None => out.push('-'),
+    }
+}
+
+fn push_list_field(out: &mut String, values: &[String]) {
+    if values.is_empty() {
+        out.push('-');
+        return;
+    }
+    out.push_str(&escape_field(&values.join(",")));
+}
+
+fn decode_optional_u16(value: &str) -> Result<Option<u16>, String> {
+    if value == "-" {
+        Ok(None)
+    } else {
+        value
+            .parse()
+            .map(Some)
+            .map_err(|err| format!("invalid numeric field: {err}"))
+    }
+}
+
+fn decode_list_field(value: &str) -> Result<Vec<String>, String> {
+    if value == "-" {
+        Ok(Vec::new())
+    } else {
+        Ok(value
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+            .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn round_trips_extended_neighbor_fields() {
+        let snapshot = RuntimeSnapshot {
+            selected_interface: Some("eth0".to_string()),
+            interfaces: Vec::new(),
+            neighbors: vec![NeighborRecord {
+                protocol: DiscoveryProtocol::Lldp,
+                chassis_id: Some("aa:bb:cc:dd:ee:ff".to_string()),
+                port_id: Some("port3".to_string()),
+                port_description: Some("uplink port".to_string()),
+                system_name: Some("switch-1".to_string()),
+                system_description: Some("test switch".to_string()),
+                management_addresses: vec!["10.0.0.2".to_string()],
+                capabilities: vec!["Bridge".to_string(), "Router".to_string()],
+                ttl_seconds: Some(120),
+                native_vlan: Some(15),
+                duplex: Some("1000Base-T full duplex".to_string()),
+            }],
+            dhcp_options: Vec::new(),
+            discovery_status: "complete".to_string(),
+            dhcp_status: "idle".to_string(),
+            last_error: None,
+        };
+
+        let encoded = encode_response(&AgentResponse::State(snapshot.clone()));
+        let decoded = decode_response(&encoded).expect("decode response");
+
+        assert_eq!(decoded, AgentResponse::State(snapshot));
     }
 }
