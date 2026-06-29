@@ -317,17 +317,21 @@ fn run_provisioning(
         format!("requesting lease on {interface}"),
     );
     match run_dhcp_client(interface) {
-        Ok(dhcp_options) => {
+        Ok(dhcp_result) => {
             if !is_current_generation(state, generation) {
                 return Ok(());
             }
 
-            update_dhcp_options(state, generation, interface, dhcp_options)?;
+            update_dhcp_options(state, generation, interface, dhcp_result.options)?;
             set_status(
                 state,
                 generation,
                 "dhcp",
-                "lease acquired and applied".to_string(),
+                if dhcp_result.lease_requested {
+                    "lease acquired and applied".to_string()
+                } else {
+                    "network configuration detected".to_string()
+                },
             );
             refresh_interface_snapshot(state, interface);
         }
@@ -977,19 +981,50 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
         .join(":")
 }
 
-fn run_dhcp_client(interface: &str) -> io::Result<Vec<DhcpOptionRecord>> {
+struct DhcpProbeResult {
+    options: Vec<DhcpOptionRecord>,
+    lease_requested: bool,
+}
+
+fn run_dhcp_client(interface: &str) -> io::Result<DhcpProbeResult> {
     let _ = Command::new("ip")
         .args(["link", "set", "dev", interface, "up"])
         .status();
 
+    let mut observed_options = collect_network_configuration(interface);
     let mut command = Command::new("dhclient");
     command
         .args(["-4", "-v", "-1", interface])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let output = run_command_with_timeout(&mut command, DHCP_TIMEOUT)?;
+    let output = match run_command_with_timeout(&mut command, DHCP_TIMEOUT) {
+        Ok(output) => output,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            observed_options.push(DhcpOptionRecord {
+                code: None,
+                name: "dhcp-client".to_string(),
+                value: "dhclient is not installed; showing active network configuration"
+                    .to_string(),
+            });
+            return return_observed_dhcp_options(observed_options, err);
+        }
+        Err(err) => return return_observed_dhcp_options(observed_options, err),
+    };
 
     if !output.status.success() {
+        observed_options.extend(parse_dhcp_leases(interface));
+        observed_options.push(DhcpOptionRecord {
+            code: None,
+            name: "dhcp-client".to_string(),
+            value: command_failure("dhclient", &output),
+        });
+        if !observed_options.is_empty() {
+            sort_dhcp_options(&mut observed_options);
+            return Ok(DhcpProbeResult {
+                options: observed_options,
+                lease_requested: false,
+            });
+        }
         return Err(io::Error::new(
             io::ErrorKind::Other,
             command_failure("dhclient", &output),
@@ -998,13 +1033,161 @@ fn run_dhcp_client(interface: &str) -> io::Result<Vec<DhcpOptionRecord>> {
 
     let mut options = parse_dhcp_output(&output.stdout);
     options.extend(parse_dhcp_leases(interface));
+    options.extend(observed_options);
+    sort_dhcp_options(&mut options);
+    Ok(DhcpProbeResult {
+        options,
+        lease_requested: true,
+    })
+}
+
+fn return_observed_dhcp_options(
+    mut options: Vec<DhcpOptionRecord>,
+    err: io::Error,
+) -> io::Result<DhcpProbeResult> {
+    if options.is_empty() {
+        return Err(err);
+    }
+    sort_dhcp_options(&mut options);
+    Ok(DhcpProbeResult {
+        options,
+        lease_requested: false,
+    })
+}
+
+fn sort_dhcp_options(options: &mut Vec<DhcpOptionRecord>) {
     options.sort_by(|left, right| {
         left.name
             .cmp(&right.name)
             .then(left.value.cmp(&right.value))
     });
     options.dedup();
-    Ok(options)
+}
+
+fn collect_network_configuration(interface: &str) -> Vec<DhcpOptionRecord> {
+    let mut records = Vec::new();
+    if let Ok(Some(address)) = read_ipv4_address(interface) {
+        records.push(DhcpOptionRecord {
+            code: Some(50),
+            name: "address".to_string(),
+            value: address,
+        });
+    }
+    records.extend(read_nmcli_dhcp_options(interface));
+    records.extend(read_route_options(interface));
+    sort_dhcp_options(&mut records);
+    records
+}
+
+fn read_nmcli_dhcp_options(interface: &str) -> Vec<DhcpOptionRecord> {
+    let output = Command::new("nmcli")
+        .args([
+            "-t",
+            "-f",
+            "GENERAL.CONNECTION,IP4.ADDRESS,IP4.GATEWAY,IP4.DNS,IP4.DOMAIN,IP4.MTU",
+            "device",
+            "show",
+            interface,
+        ])
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+
+    let mut records = Vec::new();
+    let text = String::from_utf8_lossy(&output.stdout);
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = unescape_nmcli_value(value.trim());
+        if value.is_empty() || value == "--" {
+            continue;
+        }
+
+        let base_key = key.split('[').next().unwrap_or(key);
+        match base_key {
+            "GENERAL.CONNECTION" => records.push(DhcpOptionRecord {
+                code: None,
+                name: "connection".to_string(),
+                value,
+            }),
+            "IP4.ADDRESS" => records.push(DhcpOptionRecord {
+                code: Some(50),
+                name: "address".to_string(),
+                value,
+            }),
+            "IP4.GATEWAY" => records.push(DhcpOptionRecord {
+                code: Some(3),
+                name: "routers".to_string(),
+                value,
+            }),
+            "IP4.DNS" => records.push(DhcpOptionRecord {
+                code: Some(6),
+                name: "domain-name-servers".to_string(),
+                value,
+            }),
+            "IP4.DOMAIN" => records.push(DhcpOptionRecord {
+                code: Some(15),
+                name: "domain-name".to_string(),
+                value,
+            }),
+            "IP4.MTU" => records.push(DhcpOptionRecord {
+                code: Some(26),
+                name: "interface-mtu".to_string(),
+                value,
+            }),
+            _ => {}
+        }
+    }
+    records
+}
+
+fn read_route_options(interface: &str) -> Vec<DhcpOptionRecord> {
+    let output = Command::new("ip")
+        .args(["-4", "route", "show", "dev", interface])
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+
+    let mut records = Vec::new();
+    let text = String::from_utf8_lossy(&output.stdout);
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("default via ") {
+            if let Some((gateway, _)) = rest.split_once(' ') {
+                records.push(DhcpOptionRecord {
+                    code: Some(3),
+                    name: "routers".to_string(),
+                    value: gateway.to_string(),
+                });
+            }
+        }
+    }
+    records
+}
+
+fn unescape_nmcli_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut escaped = false;
+    for ch in value.chars() {
+        if escaped {
+            out.push(ch);
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 fn parse_dhcp_output(output: &[u8]) -> Vec<DhcpOptionRecord> {

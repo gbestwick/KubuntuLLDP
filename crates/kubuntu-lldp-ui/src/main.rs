@@ -465,7 +465,10 @@ fn draw(
         }
 
         let right_panel_gap = GUTTER;
-        let right_panel_height = ((panel_height - right_panel_gap) / 2).max(180);
+        let right_available_height = (panel_height - right_panel_gap).max(240);
+        let preferred_dhcp_height = ((right_available_height * 28) / 100).max(160);
+        let dhcp_panel_height = preferred_dhcp_height.min((right_available_height - 220).max(120));
+        let right_panel_height = right_available_height - dhcp_panel_height;
         draw_panel(
             display,
             window,
