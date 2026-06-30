@@ -6,6 +6,7 @@ use std::{
     mem::MaybeUninit,
     os::raw::{c_char, c_int, c_long, c_uint, c_ulong, c_void},
     os::unix::net::UnixStream,
+    process::Command,
     ptr,
     time::{Duration, Instant},
 };
@@ -77,6 +78,17 @@ mod xlib {
         pub key: XKeyEvent,
     }
 
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    pub struct XColor {
+        pub pixel: c_ulong,
+        pub red: u16,
+        pub green: u16,
+        pub blue: u16,
+        pub flags: c_char,
+        pub pad: c_char,
+    }
+
     pub const EXPOSE: c_int = 12;
     pub const KEY_PRESS: c_int = 2;
     pub const BUTTON_PRESS: c_int = 4;
@@ -93,6 +105,7 @@ mod xlib {
         pub fn XRootWindow(display: *mut Display, screen_number: c_int) -> Window;
         pub fn XBlackPixel(display: *mut Display, screen_number: c_int) -> c_ulong;
         pub fn XWhitePixel(display: *mut Display, screen_number: c_int) -> c_ulong;
+        pub fn XDefaultColormap(display: *mut Display, screen_number: c_int) -> c_ulong;
         pub fn XDisplayWidth(display: *mut Display, screen_number: c_int) -> c_int;
         pub fn XDisplayHeight(display: *mut Display, screen_number: c_int) -> c_int;
         pub fn XCreateSimpleWindow(
@@ -120,6 +133,11 @@ mod xlib {
         pub fn XSetFont(display: *mut Display, gc: GC, font: Font) -> c_int;
         pub fn XSetForeground(display: *mut Display, gc: GC, foreground: c_ulong) -> c_int;
         pub fn XSetBackground(display: *mut Display, gc: GC, background: c_ulong) -> c_int;
+        pub fn XAllocColor(
+            display: *mut Display,
+            colormap: c_ulong,
+            screen_in_out: *mut XColor,
+        ) -> c_int;
         pub fn XClearWindow(display: *mut Display, w: Window) -> c_int;
         pub fn XFillRectangle(
             display: *mut Display,
@@ -129,6 +147,37 @@ mod xlib {
             y: c_int,
             width: u32,
             height: u32,
+        ) -> c_int;
+        pub fn XFillArc(
+            display: *mut Display,
+            d: Window,
+            gc: GC,
+            x: c_int,
+            y: c_int,
+            width: u32,
+            height: u32,
+            angle1: c_int,
+            angle2: c_int,
+        ) -> c_int;
+        pub fn XDrawArc(
+            display: *mut Display,
+            d: Window,
+            gc: GC,
+            x: c_int,
+            y: c_int,
+            width: u32,
+            height: u32,
+            angle1: c_int,
+            angle2: c_int,
+        ) -> c_int;
+        pub fn XDrawLine(
+            display: *mut Display,
+            d: Window,
+            gc: GC,
+            x1: c_int,
+            y1: c_int,
+            x2: c_int,
+            y2: c_int,
         ) -> c_int;
         pub fn XDrawRectangle(
             display: *mut Display,
@@ -177,12 +226,36 @@ const BUTTON_Y: i32 = 258;
 const MAIN_Y: i32 = 362;
 const PANEL_HEADER_HEIGHT: i32 = 54;
 const ROWS_Y: i32 = MAIN_Y + PANEL_HEADER_HEIGHT + 16;
+const RADIUS: i32 = 18;
+
+#[derive(Clone)]
+struct Palette {
+    background: c_ulong,
+    surface: c_ulong,
+    surface_alt: c_ulong,
+    border: c_ulong,
+    text: c_ulong,
+    secondary_text: c_ulong,
+    accent: c_ulong,
+    accent_soft: c_ulong,
+    success: c_ulong,
+    warning: c_ulong,
+    danger: c_ulong,
+}
 
 struct UiState {
     snapshot: Option<RuntimeSnapshot>,
     error: Option<String>,
     last_refresh: Instant,
     selected_row: Option<usize>,
+}
+
+#[derive(Copy, Clone)]
+struct WindowGeometry {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
 }
 
 fn main() -> io::Result<()> {
@@ -195,12 +268,27 @@ fn run_ui(display: *mut xlib::Display) -> io::Result<()> {
     unsafe {
         let screen = xlib::XDefaultScreen(display);
         let root = xlib::XRootWindow(display, screen);
-        let width = xlib::XDisplayWidth(display, screen) as u32;
-        let height = xlib::XDisplayHeight(display, screen) as u32;
+        let fallback = WindowGeometry {
+            x: 0,
+            y: 0,
+            width: xlib::XDisplayWidth(display, screen) as u32,
+            height: xlib::XDisplayHeight(display, screen) as u32,
+        };
+        let geometry = preferred_window_geometry().unwrap_or(fallback);
         let black = xlib::XBlackPixel(display, screen);
-        let white = xlib::XWhitePixel(display, screen);
+        let palette = load_palette(display, screen);
 
-        let window = xlib::XCreateSimpleWindow(display, root, 0, 0, width, height, 0, black, black);
+        let window = xlib::XCreateSimpleWindow(
+            display,
+            root,
+            geometry.x,
+            geometry.y,
+            geometry.width,
+            geometry.height,
+            0,
+            black,
+            palette.background,
+        );
         xlib::XSelectInput(
             display,
             window,
@@ -215,8 +303,8 @@ fn run_ui(display: *mut xlib::Display) -> io::Result<()> {
         xlib::XMapRaised(display, window);
 
         let gc = xlib::XCreateGC(display, window, 0, ptr::null_mut());
-        xlib::XSetForeground(display, gc, white);
-        xlib::XSetBackground(display, gc, black);
+        xlib::XSetForeground(display, gc, palette.text);
+        xlib::XSetBackground(display, gc, palette.background);
         let font = load_large_font(display);
         if let Some(font) = font {
             xlib::XSetFont(display, gc, (*font).fid);
@@ -230,7 +318,15 @@ fn run_ui(display: *mut xlib::Display) -> io::Result<()> {
         };
 
         refresh_state(&mut ui);
-        draw(display, window, gc, width as i32, height as i32, &ui)?;
+        draw(
+            display,
+            window,
+            gc,
+            geometry.width as i32,
+            geometry.height as i32,
+            &ui,
+            &palette,
+        )?;
 
         loop {
             while xlib::XPending(display) > 0 {
@@ -239,16 +335,32 @@ fn run_ui(display: *mut xlib::Display) -> io::Result<()> {
                 let event = event.assume_init();
                 match event.type_ {
                     xlib::EXPOSE => {
-                        draw(display, window, gc, width as i32, height as i32, &ui)?;
+                        draw(
+                            display,
+                            window,
+                            gc,
+                            geometry.width as i32,
+                            geometry.height as i32,
+                            &ui,
+                            &palette,
+                        )?;
                     }
                     xlib::BUTTON_PRESS => {
                         let button = event.button;
-                        if hit_retry(button.x, button.y, width as i32) {
+                        if hit_retry(button.x, button.y, geometry.width as i32) {
                             let _ =
                                 send_request(DEFAULT_SOCKET_PATH, AgentRequest::RetryProvisioning);
                             refresh_state(&mut ui);
-                            draw(display, window, gc, width as i32, height as i32, &ui)?;
-                        } else if hit_quit(button.x, button.y, width as i32) {
+                            draw(
+                                display,
+                                window,
+                                gc,
+                                geometry.width as i32,
+                                geometry.height as i32,
+                                &ui,
+                                &palette,
+                            )?;
+                        } else if hit_quit(button.x, button.y, geometry.width as i32) {
                             if let Some(font) = font {
                                 xlib::XFreeFont(display, font);
                             }
@@ -256,7 +368,9 @@ fn run_ui(display: *mut xlib::Display) -> io::Result<()> {
                             xlib::XDestroyWindow(display, window);
                             xlib::XCloseDisplay(display);
                             return Ok(());
-                        } else if let Some(row) = hit_test(button.x, button.y, width as i32, &ui) {
+                        } else if let Some(row) =
+                            hit_test(button.x, button.y, geometry.width as i32, &ui)
+                        {
                             if let Some(snapshot) = &ui.snapshot {
                                 if let Some(iface) = snapshot.interfaces.get(row) {
                                     let request = AgentRequest::SelectInterface {
@@ -273,7 +387,15 @@ fn run_ui(display: *mut xlib::Display) -> io::Result<()> {
                                         }
                                         Err(err) => ui.error = Some(err.to_string()),
                                     }
-                                    draw(display, window, gc, width as i32, height as i32, &ui)?;
+                                    draw(
+                                        display,
+                                        window,
+                                        gc,
+                                        geometry.width as i32,
+                                        geometry.height as i32,
+                                        &ui,
+                                        &palette,
+                                    )?;
                                 }
                             }
                         }
@@ -306,7 +428,15 @@ fn run_ui(display: *mut xlib::Display) -> io::Result<()> {
                                     AgentRequest::RetryProvisioning,
                                 );
                                 refresh_state(&mut ui);
-                                draw(display, window, gc, width as i32, height as i32, &ui)?;
+                                draw(
+                                    display,
+                                    window,
+                                    gc,
+                                    geometry.width as i32,
+                                    geometry.height as i32,
+                                    &ui,
+                                    &palette,
+                                )?;
                             }
                         }
                     }
@@ -316,7 +446,15 @@ fn run_ui(display: *mut xlib::Display) -> io::Result<()> {
 
             if ui.last_refresh.elapsed() >= Duration::from_secs(1) {
                 refresh_state(&mut ui);
-                draw(display, window, gc, width as i32, height as i32, &ui)?;
+                draw(
+                    display,
+                    window,
+                    gc,
+                    geometry.width as i32,
+                    geometry.height as i32,
+                    &ui,
+                    &palette,
+                )?;
             }
 
             std::thread::sleep(Duration::from_millis(50));
@@ -385,10 +523,13 @@ fn draw(
     width: i32,
     height: i32,
     ui: &UiState,
+    palette: &Palette,
 ) -> io::Result<()> {
     unsafe {
         xlib::XClearWindow(display, window);
-        draw_header(display, window, gc, width);
+        set_color(display, gc, palette.background);
+        xlib::XFillRectangle(display, window, gc, 0, 0, width as u32, height as u32);
+        draw_header(display, window, gc, width, palette);
 
         if let Some(error) = &ui.error {
             draw_status_card(
@@ -400,6 +541,8 @@ fn draw(
                 width - MARGIN * 2,
                 "Agent error",
                 error,
+                palette.danger,
+                palette,
             );
         }
 
@@ -413,12 +556,15 @@ fn draw(
                 width - MARGIN * 2,
                 STATUS_CARD_HEIGHT,
                 "Waiting for agent",
+                palette.surface,
+                palette.text,
+                palette,
             );
             return Ok(());
         };
 
         let selected = snapshot.selected_interface.as_deref().unwrap_or("none");
-        draw_status_cards(display, window, gc, width, snapshot, selected);
+        draw_status_cards(display, window, gc, width, snapshot, selected, palette);
 
         let (retry_x, quit_x, button_width) = button_layout(width);
         draw_button(
@@ -430,6 +576,9 @@ fn draw(
             button_width,
             BUTTON_HEIGHT,
             "Retry",
+            palette.accent,
+            palette.surface,
+            palette,
         );
         draw_button(
             display,
@@ -440,6 +589,9 @@ fn draw(
             button_width,
             BUTTON_HEIGHT,
             "Quit",
+            palette.surface_alt,
+            palette.text,
+            palette,
         );
 
         let left_width = interface_panel_width(width);
@@ -456,11 +608,21 @@ fn draw(
             left_width,
             panel_height,
             "Interfaces",
+            palette,
         );
 
         let mut y = ROWS_Y;
         for iface in &snapshot.interfaces {
-            draw_interface_row(display, window, gc, MARGIN + 16, y, left_width - 32, iface);
+            draw_interface_row(
+                display,
+                window,
+                gc,
+                MARGIN + 16,
+                y,
+                left_width - 32,
+                iface,
+                palette,
+            );
             y += TOUCH_ROW_HEIGHT + TOUCH_ROW_GAP;
         }
 
@@ -478,6 +640,7 @@ fn draw(
             right_width,
             right_panel_height,
             "LLDP / CDP Neighbor",
+            palette,
         );
         draw_neighbors(
             display,
@@ -487,6 +650,7 @@ fn draw(
             MAIN_Y + PANEL_HEADER_HEIGHT + 30,
             right_width - 36,
             snapshot,
+            palette,
         );
 
         let dhcp_y = MAIN_Y + right_panel_height + right_panel_gap;
@@ -499,6 +663,7 @@ fn draw(
             right_width,
             panel_bottom - dhcp_y,
             "DHCP Options",
+            palette,
         );
         draw_dhcp_options(
             display,
@@ -508,14 +673,21 @@ fn draw(
             dhcp_y + PANEL_HEADER_HEIGHT + 34,
             right_width - 36,
             snapshot,
+            palette,
         );
     }
     Ok(())
 }
 
-fn draw_header(display: *mut xlib::Display, window: xlib::Window, gc: xlib::GC, width: i32) {
+fn draw_header(
+    display: *mut xlib::Display,
+    window: xlib::Window,
+    gc: xlib::GC,
+    width: i32,
+    palette: &Palette,
+) {
     unsafe {
-        set_white(display, gc);
+        set_color(display, gc, palette.surface);
         xlib::XFillRectangle(
             display,
             window,
@@ -525,10 +697,12 @@ fn draw_header(display: *mut xlib::Display, window: xlib::Window, gc: xlib::GC, 
             width as u32,
             HEADER_HEIGHT as u32,
         );
-        set_black(display, gc);
+        set_color(display, gc, palette.border);
+        xlib::XFillRectangle(display, window, gc, 0, HEADER_HEIGHT - 1, width as u32, 1);
+        set_color(display, gc, palette.text);
         draw_text(display, window, gc, MARGIN, 48, "KubuntuLLDP");
-        draw_text(display, window, gc, MARGIN, 86, "Link discovery console");
-        set_white(display, gc);
+        set_color(display, gc, palette.secondary_text);
+        draw_text(display, window, gc, MARGIN, 86, "Network link discovery");
     }
 }
 
@@ -539,12 +713,22 @@ fn draw_status_cards(
     width: i32,
     snapshot: &RuntimeSnapshot,
     selected: &str,
+    palette: &Palette,
 ) {
     let card_gap = 18;
     let card_width = ((width - MARGIN * 2 - card_gap * 3) / 4).max(180);
     let mut x = MARGIN;
     draw_status_card(
-        display, window, gc, x, STATUS_Y, card_width, "Selected", selected,
+        display,
+        window,
+        gc,
+        x,
+        STATUS_Y,
+        card_width,
+        "Selected",
+        selected,
+        palette.accent,
+        palette,
     );
     x += card_width + card_gap;
     draw_status_card(
@@ -556,6 +740,8 @@ fn draw_status_cards(
         card_width,
         "Discovery",
         &snapshot.discovery_status,
+        status_color(&snapshot.discovery_status, palette),
+        palette,
     );
     x += card_width + card_gap;
     draw_status_card(
@@ -567,8 +753,11 @@ fn draw_status_cards(
         card_width,
         "DHCP",
         &snapshot.dhcp_status,
+        status_color(&snapshot.dhcp_status, palette),
+        palette,
     );
     x += card_width + card_gap;
+    let last_error = snapshot.last_error.as_deref().unwrap_or("none");
     draw_status_card(
         display,
         window,
@@ -577,7 +766,13 @@ fn draw_status_cards(
         STATUS_Y,
         width - x - MARGIN,
         "Last error",
-        snapshot.last_error.as_deref().unwrap_or("none"),
+        last_error,
+        if last_error == "none" {
+            palette.success
+        } else {
+            palette.danger
+        },
+        palette,
     );
 }
 
@@ -589,8 +784,9 @@ fn draw_neighbors(
     mut y: i32,
     width: i32,
     snapshot: &RuntimeSnapshot,
+    palette: &Palette,
 ) {
-    set_white(display, gc);
+    set_color(display, gc, palette.secondary_text);
     if snapshot.neighbors.is_empty() {
         draw_text(display, window, gc, x, y, "No neighbor discovered yet");
         return;
@@ -606,6 +802,7 @@ fn draw_neighbors(
             width,
             "Protocol",
             protocol_name(&neighbor.protocol),
+            palette,
         );
         y += LINE_HEIGHT;
         draw_field(
@@ -617,6 +814,7 @@ fn draw_neighbors(
             width,
             "Device name",
             neighbor.system_name.as_deref().unwrap_or("n/a"),
+            palette,
         );
         y += LINE_HEIGHT;
         draw_field(
@@ -628,6 +826,7 @@ fn draw_neighbors(
             width,
             "Description",
             neighbor.system_description.as_deref().unwrap_or("n/a"),
+            palette,
         );
         y += LINE_HEIGHT;
         draw_field(
@@ -639,6 +838,7 @@ fn draw_neighbors(
             width,
             "Chassis ID",
             neighbor.chassis_id.as_deref().unwrap_or("n/a"),
+            palette,
         );
         y += LINE_HEIGHT;
         draw_field(
@@ -650,6 +850,7 @@ fn draw_neighbors(
             width,
             "Remote port",
             neighbor.port_id.as_deref().unwrap_or("n/a"),
+            palette,
         );
         y += LINE_HEIGHT;
         draw_field(
@@ -661,6 +862,7 @@ fn draw_neighbors(
             width,
             "Port description",
             neighbor.port_description.as_deref().unwrap_or("n/a"),
+            palette,
         );
         y += LINE_HEIGHT;
         draw_field(
@@ -672,6 +874,7 @@ fn draw_neighbors(
             width,
             "Management IP",
             &display_list(&neighbor.management_addresses),
+            palette,
         );
         y += LINE_HEIGHT;
         draw_field(
@@ -683,6 +886,7 @@ fn draw_neighbors(
             width,
             "Capabilities",
             &display_list(&neighbor.capabilities),
+            palette,
         );
         y += LINE_HEIGHT;
         draw_field(
@@ -697,6 +901,7 @@ fn draw_neighbors(
                 .ttl_seconds
                 .map(|ttl| format!("{ttl} seconds"))
                 .unwrap_or_else(|| "n/a".to_string()),
+            palette,
         );
         y += LINE_HEIGHT;
         draw_field(
@@ -711,6 +916,7 @@ fn draw_neighbors(
                 .native_vlan
                 .map(|vlan| vlan.to_string())
                 .unwrap_or_else(|| "n/a".to_string()),
+            palette,
         );
         y += LINE_HEIGHT;
         draw_field(
@@ -722,6 +928,7 @@ fn draw_neighbors(
             width,
             "Duplex",
             neighbor.duplex.as_deref().unwrap_or("n/a"),
+            palette,
         );
         y += LINE_HEIGHT + 18;
     }
@@ -735,8 +942,9 @@ fn draw_dhcp_options(
     mut y: i32,
     width: i32,
     snapshot: &RuntimeSnapshot,
+    palette: &Palette,
 ) {
-    set_white(display, gc);
+    set_color(display, gc, palette.secondary_text);
     if snapshot.dhcp_options.is_empty() {
         draw_text(display, window, gc, x, y, "No DHCP options reported yet");
         return;
@@ -771,22 +979,34 @@ fn draw_panel(
     width: i32,
     height: i32,
     title: &str,
+    palette: &Palette,
 ) {
     unsafe {
-        set_white(display, gc);
-        xlib::XDrawRectangle(display, window, gc, x, y, width as u32, height as u32);
-        xlib::XFillRectangle(
+        fill_rounded_rect(
             display,
             window,
             gc,
             x,
             y,
-            width as u32,
-            PANEL_HEADER_HEIGHT as u32,
+            width,
+            height,
+            RADIUS,
+            palette.surface,
         );
-        set_black(display, gc);
-        draw_text(display, window, gc, x + 18, y + 36, title);
-        set_white(display, gc);
+        set_color(display, gc, palette.border);
+        draw_rounded_rect(display, window, gc, x, y, width, height, RADIUS);
+        set_color(display, gc, palette.text);
+        draw_text(display, window, gc, x + 22, y + 36, title);
+        set_color(display, gc, palette.border);
+        xlib::XFillRectangle(
+            display,
+            window,
+            gc,
+            x + 18,
+            y + PANEL_HEADER_HEIGHT,
+            (width - 36) as u32,
+            1,
+        );
     }
 }
 
@@ -799,20 +1019,28 @@ fn draw_status_card(
     width: i32,
     label: &str,
     value: &str,
+    indicator: c_ulong,
+    palette: &Palette,
 ) {
     unsafe {
-        set_white(display, gc);
-        xlib::XFillRectangle(
+        fill_rounded_rect(
             display,
             window,
             gc,
             x,
             y,
-            width as u32,
-            STATUS_CARD_HEIGHT as u32,
+            width,
+            STATUS_CARD_HEIGHT,
+            RADIUS,
+            palette.surface,
         );
-        set_black(display, gc);
-        draw_text(display, window, gc, x + 18, y + 30, label);
+        set_color(display, gc, palette.border);
+        draw_rounded_rect(display, window, gc, x, y, width, STATUS_CARD_HEIGHT, RADIUS);
+        set_color(display, gc, indicator);
+        xlib::XFillArc(display, window, gc, x + 18, y + 18, 12, 12, 0, 360 * 64);
+        set_color(display, gc, palette.secondary_text);
+        draw_text(display, window, gc, x + 38, y + 30, label);
+        set_color(display, gc, palette.text);
         draw_text(
             display,
             window,
@@ -821,7 +1049,6 @@ fn draw_status_card(
             y + 64,
             &fit_text(value, width - 36),
         );
-        set_white(display, gc);
     }
 }
 
@@ -833,31 +1060,39 @@ fn draw_interface_row(
     y: i32,
     width: i32,
     iface: &kubuntu_lldp_core::InterfaceSnapshot,
+    palette: &Palette,
 ) {
     unsafe {
         if iface.is_selected {
-            set_white(display, gc);
-            xlib::XFillRectangle(
+            fill_rounded_rect(
                 display,
                 window,
                 gc,
                 x,
                 y,
-                width as u32,
-                TOUCH_ROW_HEIGHT as u32,
+                width,
+                TOUCH_ROW_HEIGHT,
+                14,
+                palette.accent_soft,
             );
-            set_black(display, gc);
+            set_color(display, gc, palette.accent);
+            xlib::XFillRectangle(display, window, gc, x, y + 16, 4, 56);
+            set_color(display, gc, palette.text);
         } else {
-            set_white(display, gc);
-            xlib::XDrawRectangle(
+            fill_rounded_rect(
                 display,
                 window,
                 gc,
                 x,
                 y,
-                width as u32,
-                TOUCH_ROW_HEIGHT as u32,
+                width,
+                TOUCH_ROW_HEIGHT,
+                14,
+                palette.surface_alt,
             );
+            set_color(display, gc, palette.border);
+            draw_rounded_rect(display, window, gc, x, y, width, TOUCH_ROW_HEIGHT, 14);
+            set_color(display, gc, palette.text);
         }
 
         let title = format!("{}  {}", iface.name, format_state(&iface.state));
@@ -874,6 +1109,9 @@ fn draw_interface_row(
             y + 34,
             &fit_text(&title, width - 36),
         );
+        if !iface.is_selected {
+            set_color(display, gc, palette.secondary_text);
+        }
         draw_text(
             display,
             window,
@@ -882,7 +1120,6 @@ fn draw_interface_row(
             y + 66,
             &fit_text(&detail, width - 36),
         );
-        set_white(display, gc);
     }
 }
 
@@ -919,9 +1156,12 @@ fn draw_field(
     width: i32,
     label: &str,
     value: &str,
+    palette: &Palette,
 ) {
     let label_width = 190;
+    set_color(display, gc, palette.secondary_text);
     draw_text(display, window, gc, x, y, label);
+    set_color(display, gc, palette.text);
     draw_text(
         display,
         window,
@@ -956,31 +1196,247 @@ fn draw_button(
     width: i32,
     height: i32,
     label: &str,
+    fill: c_ulong,
+    text: c_ulong,
+    palette: &Palette,
 ) {
+    fill_rounded_rect(display, window, gc, x, y, width, height, RADIUS, fill);
+    if fill != palette.accent {
+        set_color(display, gc, palette.border);
+        draw_rounded_rect(display, window, gc, x, y, width, height, RADIUS);
+    }
+    set_color(display, gc, text);
+    draw_text(display, window, gc, x + 24, y + 40, label);
+}
+
+fn set_color(display: *mut xlib::Display, gc: xlib::GC, color: c_ulong) {
     unsafe {
-        xlib::XFillRectangle(display, window, gc, x, y, width as u32, height as u32);
-        set_black(display, gc);
-        draw_text(display, window, gc, x + 24, y + 40, label);
-        set_white(display, gc);
+        xlib::XSetForeground(display, gc, color);
     }
 }
 
-fn set_black(display: *mut xlib::Display, gc: xlib::GC) {
+fn load_palette(display: *mut xlib::Display, screen: c_int) -> Palette {
+    let fallback_black = unsafe { xlib::XBlackPixel(display, screen) };
+    let fallback_white = unsafe { xlib::XWhitePixel(display, screen) };
+
+    Palette {
+        background: alloc_color(display, screen, 0xf5, 0xf5, 0xf7).unwrap_or(fallback_white),
+        surface: alloc_color(display, screen, 0xff, 0xff, 0xff).unwrap_or(fallback_white),
+        surface_alt: alloc_color(display, screen, 0xeb, 0xeb, 0xf0).unwrap_or(fallback_white),
+        border: alloc_color(display, screen, 0xd2, 0xd2, 0xd7).unwrap_or(fallback_black),
+        text: alloc_color(display, screen, 0x1d, 0x1d, 0x1f).unwrap_or(fallback_black),
+        secondary_text: alloc_color(display, screen, 0x6e, 0x6e, 0x73).unwrap_or(fallback_black),
+        accent: alloc_color(display, screen, 0x00, 0x7a, 0xff).unwrap_or(fallback_black),
+        accent_soft: alloc_color(display, screen, 0xd9, 0xec, 0xff).unwrap_or(fallback_white),
+        success: alloc_color(display, screen, 0x34, 0xc7, 0x59).unwrap_or(fallback_black),
+        warning: alloc_color(display, screen, 0xff, 0x95, 0x00).unwrap_or(fallback_black),
+        danger: alloc_color(display, screen, 0xff, 0x3b, 0x30).unwrap_or(fallback_black),
+    }
+}
+
+fn alloc_color(
+    display: *mut xlib::Display,
+    screen: c_int,
+    red: u8,
+    green: u8,
+    blue: u8,
+) -> Option<c_ulong> {
+    let colormap = unsafe { xlib::XDefaultColormap(display, screen) };
+    let mut color = xlib::XColor {
+        pixel: 0,
+        red: u16::from(red) * 257,
+        green: u16::from(green) * 257,
+        blue: u16::from(blue) * 257,
+        flags: 0,
+        pad: 0,
+    };
+
+    let result = unsafe { xlib::XAllocColor(display, colormap, &mut color) };
+    (result != 0).then_some(color.pixel)
+}
+
+fn status_color(status: &str, palette: &Palette) -> c_ulong {
+    let lower = status.to_ascii_lowercase();
+    if lower.contains("error") || lower.contains("fail") {
+        palette.danger
+    } else if lower.contains("complete")
+        || lower.contains("detected")
+        || lower.contains("up")
+        || lower.contains("neighbor")
+    {
+        palette.success
+    } else {
+        palette.warning
+    }
+}
+
+fn fill_rounded_rect(
+    display: *mut xlib::Display,
+    window: xlib::Window,
+    gc: xlib::GC,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    radius: i32,
+    color: c_ulong,
+) {
+    let radius = radius.min(width / 2).min(height / 2).max(0);
+    let diameter = radius * 2;
+
     unsafe {
-        xlib::XSetForeground(
+        set_color(display, gc, color);
+        xlib::XFillRectangle(
             display,
+            window,
             gc,
-            xlib::XBlackPixel(display, xlib::XDefaultScreen(display)),
+            x + radius,
+            y,
+            (width - diameter).max(0) as u32,
+            height as u32,
         );
+        xlib::XFillRectangle(
+            display,
+            window,
+            gc,
+            x,
+            y + radius,
+            width as u32,
+            (height - diameter).max(0) as u32,
+        );
+
+        if radius > 0 {
+            xlib::XFillArc(
+                display,
+                window,
+                gc,
+                x,
+                y,
+                diameter as u32,
+                diameter as u32,
+                90 * 64,
+                90 * 64,
+            );
+            xlib::XFillArc(
+                display,
+                window,
+                gc,
+                x + width - diameter,
+                y,
+                diameter as u32,
+                diameter as u32,
+                0,
+                90 * 64,
+            );
+            xlib::XFillArc(
+                display,
+                window,
+                gc,
+                x,
+                y + height - diameter,
+                diameter as u32,
+                diameter as u32,
+                180 * 64,
+                90 * 64,
+            );
+            xlib::XFillArc(
+                display,
+                window,
+                gc,
+                x + width - diameter,
+                y + height - diameter,
+                diameter as u32,
+                diameter as u32,
+                270 * 64,
+                90 * 64,
+            );
+        }
     }
 }
 
-fn set_white(display: *mut xlib::Display, gc: xlib::GC) {
+fn draw_rounded_rect(
+    display: *mut xlib::Display,
+    window: xlib::Window,
+    gc: xlib::GC,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    radius: i32,
+) {
+    let radius = radius.min(width / 2).min(height / 2).max(0);
+    let diameter = radius * 2;
+
     unsafe {
-        xlib::XSetForeground(
+        if radius == 0 {
+            xlib::XDrawRectangle(display, window, gc, x, y, width as u32, height as u32);
+            return;
+        }
+
+        xlib::XDrawLine(display, window, gc, x + radius, y, x + width - radius, y);
+        xlib::XDrawLine(
             display,
+            window,
             gc,
-            xlib::XWhitePixel(display, xlib::XDefaultScreen(display)),
+            x + radius,
+            y + height,
+            x + width - radius,
+            y + height,
+        );
+        xlib::XDrawLine(display, window, gc, x, y + radius, x, y + height - radius);
+        xlib::XDrawLine(
+            display,
+            window,
+            gc,
+            x + width,
+            y + radius,
+            x + width,
+            y + height - radius,
+        );
+
+        xlib::XDrawArc(
+            display,
+            window,
+            gc,
+            x,
+            y,
+            diameter as u32,
+            diameter as u32,
+            90 * 64,
+            90 * 64,
+        );
+        xlib::XDrawArc(
+            display,
+            window,
+            gc,
+            x + width - diameter,
+            y,
+            diameter as u32,
+            diameter as u32,
+            0,
+            90 * 64,
+        );
+        xlib::XDrawArc(
+            display,
+            window,
+            gc,
+            x,
+            y + height - diameter,
+            diameter as u32,
+            diameter as u32,
+            180 * 64,
+            90 * 64,
+        );
+        xlib::XDrawArc(
+            display,
+            window,
+            gc,
+            x + width - diameter,
+            y + height - diameter,
+            diameter as u32,
+            diameter as u32,
+            270 * 64,
+            90 * 64,
         );
     }
 }
@@ -1007,11 +1463,68 @@ fn draw_text(
     }
 }
 
+fn preferred_window_geometry() -> Option<WindowGeometry> {
+    let output = Command::new("xrandr").arg("--query").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let mut connected = Vec::new();
+
+    for line in stdout.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(name) = parts.next() else {
+            continue;
+        };
+        let Some(state) = parts.next() else {
+            continue;
+        };
+        if state != "connected" {
+            continue;
+        }
+
+        for token in parts {
+            if let Some(geometry) = parse_geometry_token(token) {
+                connected.push((name.to_string(), geometry));
+                break;
+            }
+        }
+    }
+
+    connected
+        .iter()
+        .find(|(name, _)| name.starts_with("eDP") || name.starts_with("LVDS"))
+        .map(|(_, geometry)| *geometry)
+        .or_else(|| {
+            connected
+                .into_iter()
+                .min_by_key(|(_, geometry)| geometry.x)
+                .map(|(_, g)| g)
+        })
+}
+
+fn parse_geometry_token(token: &str) -> Option<WindowGeometry> {
+    let (size, position) = token.split_once('+')?;
+    let (width, height) = size.split_once('x')?;
+    let (x, y) = position.split_once('+')?;
+
+    Some(WindowGeometry {
+        x: x.parse().ok()?,
+        y: y.parse().ok()?,
+        width: width.parse().ok()?,
+        height: height.parse().ok()?,
+    })
+}
+
 fn load_large_font(display: *mut xlib::Display) -> Option<*mut xlib::XFontStruct> {
     let candidates = [
-        "-misc-dejavu sans-medium-r-normal--24-0-0-0-p-0-iso10646-1",
-        "-misc-ubuntu sans-medium-r-normal--24-0-0-0-p-0-iso10646-1",
-        "-misc-noto sans-medium-r-normal--24-0-0-0-p-0-iso10646-1",
+        "-urw-nimbus sans l-regular-r-normal--24-0-0-0-p-0-iso8859-1",
+        "-urw-nimbus sans l-bold-r-normal--24-0-0-0-p-0-iso8859-1",
+        "-adobe-helvetica-medium-r-normal--24-0-0-0-p-0-iso8859-1",
+        "-adobe-helvetica-bold-r-normal--24-0-0-0-p-0-iso8859-1",
+        "-schumacher-clean-medium-r-normal--16-160-75-75-c-80-iso646.1991-irv",
+        "-schumacher-clean-medium-r-normal--14-140-75-75-c-80-iso646.1991-irv",
         "12x24",
         "10x20",
         "9x15bold",
